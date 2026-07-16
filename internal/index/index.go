@@ -39,11 +39,15 @@ func IsCorrupt(err error) bool { return errors.Is(err, errCorruptIndex) }
 var lastIngestFiles int
 
 type FileState struct {
-	Path        string `json:"path"`
-	Size        int64  `json:"size"`
-	MTime       int64  `json:"mtime"`
-	LastUpdated int64  `json:"last_updated,omitempty"`
-	Redactions  int    `json:"redactions,omitempty"`
+	Path          string `json:"path"`
+	Size          int64  `json:"size"`
+	MTime         int64  `json:"mtime"`
+	MetadataSize  int64  `json:"metadata_size,omitempty"`
+	MetadataMTime int64  `json:"metadata_mtime,omitempty"`
+	CWDSize       int64  `json:"cwd_size,omitempty"`
+	CWDMTime      int64  `json:"cwd_mtime,omitempty"`
+	LastUpdated   int64  `json:"last_updated,omitempty"`
+	Redactions    int    `json:"redactions,omitempty"`
 	// SafeSize is the offset just past the last complete line at index time.
 	// A session file caught mid-write ends in a torn line; parsing skips it,
 	// and the next append must resume from here or that message is lost.
@@ -463,6 +467,9 @@ func load(h string) []model.Session {
 	}
 	if h == "" || h == "antigravity" {
 		ss = append(ss, sources.LoadAntigravity()...)
+	}
+	if h == "" || h == "grok" {
+		ss = append(ss, sources.LoadGrok()...)
 	}
 	return ss
 }
@@ -1103,7 +1110,11 @@ func appendIncremental(dir, harness, scope string, old Manifest, files map[strin
 	return filesTouched, messages, nil
 }
 
-func sameFile(a, b FileState) bool { return a.Path == b.Path && a.Size == b.Size && a.MTime == b.MTime }
+func sameFile(a, b FileState) bool {
+	return a.Path == b.Path && a.Size == b.Size && a.MTime == b.MTime &&
+		a.MetadataSize == b.MetadataSize && a.MetadataMTime == b.MetadataMTime &&
+		a.CWDSize == b.CWDSize && a.CWDMTime == b.CWDMTime
+}
 
 func parseChangedFile(harness, p string, old FileState) ([]model.Session, error) {
 	switch harnessForPath(p) {
@@ -1131,6 +1142,8 @@ func parseChangedFile(harness, p string, old FileState) ([]model.Session, error)
 		return sources.ParseCursorTranscript(p)
 	case "antigravity":
 		return sources.ParseAntigravityFile(p)
+	case "grok":
+		return sources.ParseGrokFile(p)
 	default:
 		return nil, nil
 	}
@@ -1194,6 +1207,9 @@ func harnessForPath(p string) string {
 				return "antigravity"
 			}
 		}
+	}
+	if filepath.Base(p) == "updates.jsonl" && strings.HasPrefix(p, filepath.Join(sources.GrokRoot(), "sessions")) {
+		return "grok"
 	}
 	return ""
 }
@@ -1267,12 +1283,27 @@ func currentFiles(h string) map[string]FileState {
 			paths[p] = true
 		}
 	}
+	if h == "" || h == "grok" {
+		for _, p := range sources.GrokSessionFiles() {
+			paths[p] = true
+		}
+	}
 	out := map[string]FileState{}
 	for p := range paths {
 		if fi, err := os.Lstat(p); err == nil && fi.Mode()&os.ModeSymlink == 0 && !fi.IsDir() {
 			fs := FileState{Path: p, Size: fi.Size(), MTime: fi.ModTime().UnixNano()}
 			if strings.HasSuffix(p, ".jsonl") {
 				fs.SafeSize = lastCompleteLineOffset(p, fi.Size())
+			}
+			if harnessForPath(p) == "grok" {
+				if summary, err := os.Lstat(filepath.Join(filepath.Dir(p), "summary.json")); err == nil && summary.Mode()&os.ModeSymlink == 0 && !summary.IsDir() {
+					fs.MetadataSize = summary.Size()
+					fs.MetadataMTime = summary.ModTime().UnixNano()
+				}
+				if cwd, err := os.Lstat(filepath.Join(filepath.Dir(filepath.Dir(p)), ".cwd")); err == nil && cwd.Mode()&os.ModeSymlink == 0 && !cwd.IsDir() {
+					fs.CWDSize = cwd.Size()
+					fs.CWDMTime = cwd.ModTime().UnixNano()
+				}
 			}
 			out[p] = fs
 		}

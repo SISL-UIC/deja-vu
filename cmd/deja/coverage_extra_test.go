@@ -253,7 +253,7 @@ func TestMainHelpersFallbackAndSourcesBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("DEJA_AIDER_ROOTS", aiderDir)
-	if got := pathSize("(home + DEJA_AIDER_ROOTS)"); got == 0 {
+	if got := pathSize(aiderDir); got != 5 {
 		t.Fatalf("aider pathSize = %d", got)
 	}
 	dir := t.TempDir()
