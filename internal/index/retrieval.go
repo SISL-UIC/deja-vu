@@ -202,6 +202,9 @@ func RelevanceTerms(q string) []string {
 		if len([]rune(f)) < 2 || (len(f) < 3 && !isCJK([]rune(f)[0])) || search.IsStopWord(f) || seen[f] {
 			continue
 		}
+		if cjkFunctionBigram(f) {
+			continue
+		}
 		seen[f] = true
 		out = append(out, f)
 	}
@@ -777,6 +780,10 @@ func RecentProject(dir, project string, n int) ([]model.Session, error) {
 // records.bin. The per-session variant re-scanned the whole log for every
 // session, which turned a session-start hook into hundreds of milliseconds.
 func sessionsForMetas(dir string, metas []SessionMeta) ([]model.Session, error) {
+	tbl, terr := loadRecordTables(dir)
+	if terr != nil {
+		return nil, terr
+	}
 	want := make(map[string]int, len(metas))
 	out := make([]model.Session, len(metas))
 	for i, meta := range metas {
@@ -787,7 +794,7 @@ func sessionsForMetas(dir string, metas []SessionMeta) ([]model.Session, error) 
 	for k := range want {
 		keys[k] = true
 	}
-	err := eachRecordForKeys(filepath.Join(dir, "records.bin"), keys, func(r Record) {
+	err := eachRecordForKeys(filepath.Join(dir, "records.bin"), tbl, keys, func(r Record) {
 		if i, ok := want[r.Key]; ok {
 			out[i].Messages = append(out[i].Messages, model.Message{Role: r.Role, Text: r.Text, Time: r.Time})
 		}
@@ -864,7 +871,7 @@ func FindByPrefix(dir, p string) (model.Session, bool, error) {
 	sort.Slice(matches, func(i, j int) bool { return matches[i].Updated.After(matches[j].Updated) })
 	meta := matches[0]
 	s := sessionFromMeta(meta)
-	recs, err := recordsForKey(filepath.Join(dir, "records.bin"), meta.Harness+":"+meta.ID)
+	recs, err := recordsForKey(filepath.Join(dir, "records.bin"), tablesFromManifest(m), meta.Harness+":"+meta.ID)
 	if err != nil {
 		return model.Session{}, false, err
 	}
@@ -913,12 +920,12 @@ func scanRecordsWithVariants(dir string, m Manifest, o query.Options, offsets []
 		defer func() { _ = f.Close() }()
 		offsets = sortedUniqueOffsets(offsets)
 		for _, off := range offsets {
-			if r, err := readRecordAt(f, off); err == nil && recordMatchesQueryVariants(r, o, variants) {
+			if r, err := readRecordAt(f, off, tablesFromManifest(m)); err == nil && recordMatchesQueryVariants(r, o, variants) {
 				add(r)
 			}
 		}
 	} else {
-		if err := eachRecord(filepath.Join(dir, "records.bin"), func(r Record) {
+		if err := eachRecord(filepath.Join(dir, "records.bin"), tablesFromManifest(m), func(r Record) {
 			if recordMatchesQueryVariants(r, o, variants) {
 				add(r)
 			}
@@ -1135,14 +1142,14 @@ func fuzzyPostings(dir string, terms, phrases []string) ([]posting, map[string][
 	if !hasFuzzyToken(terms) {
 		return nil, nil, nil
 	}
-	catalog, err := tokenCatalog(dir)
+	idx, err := tokenIndexCached(dir)
 	if err != nil {
 		return nil, nil, err
 	}
 	perToken := make([]map[int64]posting, len(terms))
 	variants := map[string][]string{}
 	for i, term := range terms {
-		matches := closeTokens(term, catalog)
+		matches := closeTokens(term, idx)
 		if len(matches) == 0 {
 			return nil, nil, nil
 		}
@@ -1202,7 +1209,7 @@ func stemPostings(dir string, terms, phrases []string) ([]posting, map[string][]
 	if !hasStemToken(terms) {
 		return nil, nil, nil
 	}
-	catalog, err := tokenCatalog(dir)
+	catalog, err := tokenCatalogCached(dir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1601,22 +1608,26 @@ func tokenCatalog(dir string) (map[string]bool, error) {
 	return catalog, nil
 }
 
-func closeTokens(query string, catalog map[string]bool) []string {
+func closeTokens(query string, idx *tokenIndex) []string {
 	type match struct {
 		token    string
 		distance int
 	}
 	var matches []match
+	qr := len([]rune(query))
 	limit := 1
-	if len([]rune(query)) >= 8 {
+	if qr >= 8 {
 		limit = 2
 	}
-	for token := range catalog {
-		d := damerauDistance(query, token, limit)
-		if d <= limit {
+	// An edit changes the length by at most one and a transposition not at
+	// all, so only tokens within the limit of the query's length can match.
+	// Walking those buckets replaces a Damerau-Levenshtein run against every
+	// token in the corpus — ~200k of them — with a few short slices.
+	idx.candidates(qr, limit, func(token string) {
+		if d := damerauDistance(query, token, limit); d <= limit {
 			matches = append(matches, match{token: token, distance: d})
 		}
-	}
+	})
 	sort.Slice(matches, func(i, j int) bool {
 		if matches[i].distance == matches[j].distance {
 			return matches[i].token < matches[j].token
@@ -1631,6 +1642,17 @@ func closeTokens(query string, catalog map[string]bool) []string {
 		out[i] = m.token
 	}
 	return out
+}
+
+// isASCIIString reports whether every byte is one rune, so the byte length is
+// the rune count.
+func isASCIIString(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
 }
 
 func damerauDistance(a, b string, max int) int {
