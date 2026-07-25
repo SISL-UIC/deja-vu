@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/vshulcz/deja-vu/internal/redact"
+	"github.com/vshulcz/deja-vu/internal/sources"
 )
 
 type SyncRecord struct {
@@ -27,34 +28,65 @@ type SyncRecord struct {
 	Time      time.Time `json:"time"`
 }
 
-// Export writes records newer than the per-source watermarks. ExportFull
-// ignores watermarks so a fresh machine can receive the whole history even
-// after earlier batch dirs are gone; import-side dedupe makes it safe.
+// Export writes records newer than the watermarks for an unnamed peer (a
+// manual `deja sync export`). ExportFull ignores watermarks so a fresh
+// machine can receive the whole history even after earlier batch dirs are
+// gone; import-side dedupe makes it safe.
 func Export(dir, outDir string) (int, error) {
-	return exportRecords(dir, outDir, false)
+	return exportRecords(dir, outDir, "", false)
 }
 
 func ExportFull(dir, outDir string) (int, error) {
-	return exportRecords(dir, outDir, true)
+	return exportRecords(dir, outDir, "", true)
 }
 
 // ExportDeferred writes batches like Export but does not advance the
 // watermarks; the returned commit persists them once the receiver has
 // acknowledged the batch. Watermarked sync must be acknowledged delivery:
 // advancing on a failed transport silently drops records from the next push.
-func ExportDeferred(dir, outDir string) (int, func() error, error) {
-	return exportRecordsDeferred(dir, outDir, false)
+func ExportDeferred(dir, outDir, peer string) (int, func() error, error) {
+	return exportRecordsDeferred(dir, outDir, peer, false)
 }
 
-func exportRecords(dir, outDir string, full bool) (int, error) {
-	n, commit, err := exportRecordsDeferred(dir, outDir, full)
+// watermarkKey namespaces a source's watermark by peer: what a laptop has
+// already received says nothing about what a server has. An empty peer keeps
+// the bare source key, so manifests written before this existed still read.
+func watermarkKey(peer, source string) string {
+	if peer == "" {
+		return source
+	}
+	return peer + "\x00" + source
+}
+
+// exportBoundaryCap bounds how many record identities a watermark carries.
+// The manifest is read on every search, so this is a size trade: only sources
+// whose records actually tie on a timestamp carry a full set, and those are
+// the ones the boundary exists for — aider stamps a whole session with its
+// start time, which blows any small cap and would resend that session on
+// every push. A full set costs ~4 KB; a source that still overflows falls
+// back to resending its newest instant, which import dedupes.
+const exportBoundaryCap = 512
+
+// recordIdentity is a stable fingerprint of one exported record.
+func recordIdentity(r Record) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(r.Key))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(r.Role))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(r.Text))
+	return h.Sum64()
+}
+
+func exportRecords(dir, outDir, peer string, full bool) (int, error) {
+	n, commit, err := exportRecordsDeferred(dir, outDir, peer, full)
 	if err != nil {
 		return n, err
 	}
 	return n, commit()
 }
 
-func exportRecordsDeferred(dir, outDir string, full bool) (int, func() error, error) {
+func exportRecordsDeferred(dir, outDir, peer string, full bool) (int, func() error, error) {
 	if dir == "" {
 		dir = DefaultDir()
 	}
@@ -78,6 +110,21 @@ func exportRecordsDeferred(dir, outDir string, full bool) (int, func() error, er
 	for k, v := range m.ExportWatermarks {
 		nextWatermarks[k] = v
 	}
+	// Records that already went out at exactly the watermark instant. Time
+	// alone cannot resume precisely when a harness stamps a whole session
+	// with one timestamp, so the boundary is remembered by record identity.
+	sentAtBoundary := map[string]map[uint64]bool{}
+	for k, hashes := range m.ExportBoundary {
+		set := make(map[uint64]bool, len(hashes))
+		for _, h := range hashes {
+			set[h] = true
+		}
+		sentAtBoundary[k] = set
+	}
+	nextBoundary := map[string]map[uint64]bool{}
+	// Only sources this export actually touched may have their watermark or
+	// boundary rewritten; pushing project B must leave project A's alone.
+	touched := map[string]bool{}
 	err = eachRecord(filepath.Join(dir, "records.bin"), func(r Record) {
 		if r.SourcePath == syncImportPath {
 			return
@@ -86,8 +133,18 @@ func exportRecordsDeferred(dir, outDir string, full bool) (int, func() error, er
 		if source == "" {
 			source = r.Key
 		}
-		if !full && !r.Time.IsZero() && r.Time.UnixNano() <= m.ExportWatermarks[source] {
-			return
+		wk := watermarkKey(peer, source)
+		rh := recordIdentity(r)
+		if !full && !r.Time.IsZero() {
+			wm := m.ExportWatermarks[wk]
+			// Strictly older is settled; a record sharing the watermark
+			// instant is only settled if it was in that push.
+			if r.Time.UnixNano() < wm {
+				return
+			}
+			if r.Time.UnixNano() == wm && sentAtBoundary[wk][rh] {
+				return
+			}
 		}
 		meta, ok := m.Sessions[r.Key]
 		if !ok {
@@ -96,8 +153,20 @@ func exportRecordsDeferred(dir, outDir string, full bool) (int, func() error, er
 		text, _ := redact.Text(r.Text)
 		rec := SyncRecord{Harness: meta.Harness, SessionID: meta.ID, Project: meta.Project, Role: r.Role, Text: text, Time: r.Time}
 		bySource[source] = append(bySource[source], rec)
-		if r.Time.UnixNano() > nextWatermarks[source] {
-			nextWatermarks[source] = r.Time.UnixNano()
+		touched[wk] = true
+		tn := r.Time.UnixNano()
+		switch {
+		case tn > nextWatermarks[wk]:
+			nextWatermarks[wk] = tn
+			nextBoundary[wk] = map[uint64]bool{rh: true}
+		case tn == nextWatermarks[wk]:
+			if nextBoundary[wk] == nil {
+				nextBoundary[wk] = map[uint64]bool{}
+				for h := range sentAtBoundary[wk] {
+					nextBoundary[wk][h] = true
+				}
+			}
+			nextBoundary[wk][rh] = true
 		}
 	})
 	if err != nil {
@@ -138,9 +207,26 @@ func exportRecordsDeferred(dir, outDir string, full bool) (int, func() error, er
 		if cur.ExportWatermarks == nil {
 			cur.ExportWatermarks = map[string]int64{}
 		}
-		for source, wm := range nextWatermarks {
-			if wm > cur.ExportWatermarks[source] {
-				cur.ExportWatermarks[source] = wm
+		if cur.ExportBoundary == nil {
+			cur.ExportBoundary = map[string][]uint64{}
+		}
+		for source := range touched {
+			wm := nextWatermarks[source]
+			if wm < cur.ExportWatermarks[source] {
+				continue
+			}
+			cur.ExportWatermarks[source] = wm
+			// Above the cap the boundary set stops being cheap; drop it and
+			// let the next push resend that instant — import dedupes.
+			if set := nextBoundary[source]; len(set) > 0 && len(set) <= exportBoundaryCap {
+				hashes := make([]uint64, 0, len(set))
+				for h := range set {
+					hashes = append(hashes, h)
+				}
+				sort.Slice(hashes, func(i, j int) bool { return hashes[i] < hashes[j] })
+				cur.ExportBoundary[source] = hashes
+			} else {
+				delete(cur.ExportBoundary, source)
 			}
 		}
 		return writeManifestOnly(dir, cur)
@@ -157,6 +243,8 @@ func Import(dir, inDir string) (int, error) {
 		return 0, err
 	}
 	defer unlock()
+	dead := readTombstones()
+	ex := sources.NewExcluder()
 	if !HasManifest(dir) {
 		if err := initEmptyIndex(dir); err != nil {
 			return 0, err
@@ -195,6 +283,17 @@ func Import(dir, inDir string) (int, error) {
 				return nil
 			}
 			importID := ImportedSessionID(sr.Harness, origID)
+			// Forgetting is primary data, not cache: a tombstoned session
+			// must stay dead even when the peer still holds the batch and
+			// this index was wiped and rebuilt.
+			if dead[sr.Harness+":"+importID] {
+				return nil
+			}
+			// The exclude list keeps a project out of this machine's memory;
+			// a sync from another machine must not put it back.
+			if ex.Match(sr.Project) {
+				return nil
+			}
 			key := sr.Harness + ":" + importID
 			text, _ := redact.Text(sr.Text)
 			recsByKey[key] = append(recsByKey[key], Record{Key: key, Role: sr.Role, Text: text, Time: sr.Time, SourcePath: syncImportPath})
