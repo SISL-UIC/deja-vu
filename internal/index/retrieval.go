@@ -1361,40 +1361,135 @@ var devSynonyms = func() map[string][]string {
 var cyrEndings = []string{
 	"иями", "ями", "ами", "ией", "иях", "ях", "ах", "ов", "ев", "ей",
 	"ой", "ий", "ия", "ию", "ии", "ие", "ый", "ая", "ое", "ые",
-	"ть", "л", "ла", "ло", "ли", "а", "я", "у", "ю", "ы", "и", "е", "о",
+	"ью", "ям", "ем", "ом",
+	"ть", "л", "ла", "ло", "ли", "а", "я", "у", "ю", "ы", "и", "е", "о", "ь",
+}
+
+// endsInfinitive reports whether a ть-final term is shaped like a verb: the
+// rune before "ть" is a vowel. Consonant-stem infinitives (лезть, сесть,
+// класть) are misread as nouns and lose the verb branch — 11 reachable pairs
+// across a 20k frequency list, against closing часть -> час and весть -> вес,
+// which are common words landing on a different lemma entirely.
+func endsInfinitive(term string) bool {
+	if !strings.HasSuffix(term, "ть") {
+		return false
+	}
+	runes := []rune(term)
+	if len(runes) < 3 {
+		return false
+	}
+	switch runes[len(runes)-3] {
+	case 'а', 'е', 'ё', 'и', 'о', 'у', 'ы', 'э', 'ю', 'я':
+		return true
+	}
+	return false
+}
+
+// cyrSoftEndings is the third-declension feminine paradigm, and the only set
+// that may attach to a stem exposed by stripping a soft sign. Attaching the
+// hard adjective endings there is what folded цель onto целая and верь onto
+// вера: сеть->сети needs "и", цель->целая needs "ая", so keeping the two
+// tables apart separates shapes that look identical by length alone.
+var cyrSoftEndings = []string{"и", "ью", "ям", "ях", "ями", "ей", "е", "я", "ю", "ем"}
+
+// cyrVerbEndings are the infinitive and past-tense endings.
+var cyrVerbEndings = map[string]bool{"ть": true, "л": true, "ла": true, "ло": true, "ли": true}
+
+// cyrVerbEndingList is what a ь-final infinitive's stem takes back: the past
+// tense plus the present-tense vowels, so знать reaches both знал and знаю.
+var cyrVerbEndingList = []string{"ть", "л", "ла", "ло", "ли", "ю", "у", "а", "я", "е", "и", "ем"}
+
+// cyrNominalEndings are unambiguously noun-case: a stem exposed by stripping
+// one of these came from a noun, so verb endings must not attach to it —
+// весом strips to вес, and вес+ть is весть. Endings a verb can also carry
+// (ю, у, а, и ...) stay out of this set, so знаю -> зна -> знать survives.
+var cyrNominalEndings = map[string]bool{
+	"иями": true, "ями": true, "ами": true, "ией": true, "иях": true,
+	"ях": true, "ах": true, "ов": true, "ев": true, "ей": true, "ой": true,
+	"ий": true, "ия": true, "ию": true, "ии": true, "ие": true,
+	"ый": true, "ая": true, "ое": true, "ые": true, "ом": true,
+}
+
+// cyrMatchForms folds a Russian term onto its inflection family for the
+// relevance tier: strip a known ending, then re-attach the endings that
+// belong to the same paradigm. Four runes is the floor — below it the
+// three-letter function words (что, как, его) would fan out for nothing.
+//
+// The tier has no catalog gate, so whatever this invents is looked up for
+// real and can surface a session. That is why stripping and re-attaching use
+// different tables: one shared table folded цель onto целая.
+func cyrMatchForms(term string) []string {
+	runes := []rune(term)
+	if len(runes) < 4 {
+		return nil
+	}
+	seen := map[string]bool{term: true}
+	forms := make([]string, 0, len(cyrEndings)+1)
+	add := func(f string) {
+		if !seen[f] {
+			seen[f] = true
+			forms = append(forms, f)
+		}
+	}
+	if strings.HasSuffix(term, "ь") {
+		// Soft stem — the third-declension nouns: сеть, жизнь, ночь, очередь.
+		if base := strings.TrimSuffix(term, "ь"); len([]rune(base)) >= 3 {
+			// The bare stem is deliberately not emitted: a third-declension
+			// noun's stem is not a word on its own (сеть -> сет), while for a
+			// ь-final imperative it is — борись would recall Борис.
+			for _, end := range cyrSoftEndings {
+				add(base + end)
+			}
+		}
+		// A ь-final infinitive is a verb, not a noun: знать -> знал. But a
+		// noun can end in "ть" too, and часть taking the verb branch reaches
+		// час — a different lemma entirely. Infinitives are vowel + ть
+		// (де-лать, зна-ть, ви-деть); ть-final nouns are consonant + ть
+		// (час-ть, вес-ть, лес-ть, кос-ть). That also closes весть -> вес,
+		// which was the surviving inverse of весом -> весть.
+		if strings.HasSuffix(term, "ть") && endsInfinitive(term) {
+			if base := strings.TrimSuffix(term, "ть"); len([]rune(base)) >= 3 {
+				add(base)
+				for _, end := range cyrVerbEndingList {
+					add(base + end)
+				}
+			}
+		}
+		return forms
+	}
+	base, stripped := term, ""
+	for _, end := range cyrEndings {
+		if strings.HasSuffix(term, end) && len(runes)-len([]rune(end)) >= 3 {
+			base, stripped = strings.TrimSuffix(term, end), end
+			break
+		}
+	}
+	if base != term {
+		add(base)
+	}
+	nominal := cyrNominalEndings[stripped]
+	for _, end := range cyrEndings {
+		if nominal && cyrVerbEndings[end] {
+			continue
+		}
+		add(base + end)
+	}
+	return forms
 }
 
 // cyrSuffixForms bridges Russian inflection: strip the longest known ending,
 // then re-attach each — миграция matches миграции and миграцию. ASCII terms
 // return nothing.
 func cyrSuffixForms(term string) []string {
-	runes := []rune(term)
-	if len(runes) < 5 {
+	if !isCyrToken(term) {
 		return nil
 	}
-	cyr := false
-	for _, r := range runes {
-		if r >= 'а' && r <= 'я' || r == 'ё' {
-			cyr = true
-			break
-		}
-	}
-	if !cyr {
-		return nil
-	}
-	base := term
-	for _, end := range cyrEndings {
-		if strings.HasSuffix(term, end) && len([]rune(term))-len([]rune(end)) >= 4 {
-			base = strings.TrimSuffix(term, end)
-			break
-		}
-	}
-	forms := make([]string, 0, len(cyrEndings)+1)
-	forms = append(forms, base)
-	for _, end := range cyrEndings {
-		forms = append(forms, base+end)
-	}
-	return forms
+	// Both tiers fold Russian the same way. This one used to strip and
+	// re-attach from one shared table, which is the цель->целая shape the
+	// relevance tier was fixed for — it survived here one tier over, letting
+	// пусть recall a session that only says пустой. The catalog gate and the
+	// 8-match cap made it milder, not correct.
+	return cyrMatchForms(term)
 }
 
 func suffixForms(word string) []string {
@@ -1771,14 +1866,28 @@ func recordMatchesQueryVariants(r Record, o query.Options, variants map[string][
 	return query.MatchesParts(r.Text, terms, phrases, variants)
 }
 
+// bucket shards a token by its opening characters. It used to slice two
+// *bytes*, which for any non-ASCII token is a prefix plus half a UTF-8
+// sequence: safe() mapped the broken half to "_", so every Russian, Chinese
+// and Greek token in the corpus landed in the single bucket "t_". Each lookup
+// then had to scan the whole non-ASCII vocabulary. Sharding by runes keeps
+// ASCII bucket names exactly as they were and spreads the rest over 256.
 func bucket(tok string) string {
-	if len(tok) >= 2 {
-		return safe(tok[:2])
+	runes := []rune(tok)
+	if len(runes) >= 2 && isShardASCII(runes[0]) && isShardASCII(runes[1]) {
+		return safe(string(runes[:2]))
+	}
+	if len(runes) > 3 {
+		runes = runes[:3]
 	}
 	h := fnv.New32a()
-	_, _ = h.Write([]byte(tok))
+	_, _ = h.Write([]byte(string(runes)))
 	return fmt.Sprintf("x%02x", h.Sum32()%256)
 }
+
+// isShardASCII reports whether a rune is one byte wide, so slicing it cannot
+// split a multi-byte sequence.
+func isShardASCII(r rune) bool { return r < 128 }
 
 func safe(s string) string {
 	return strings.Map(func(r rune) rune {
@@ -1794,15 +1903,14 @@ func safe(s string) string {
 // empty buckets.
 func stemMatchForms(term string) []string {
 	runes := []rune(term)
+	// Cyrillic terms took the ASCII path, which appends English suffixes to
+	// Russian words — "миграции" became "миграцииed" and read nothing but
+	// empty buckets, so the relevance-tier fold was a no-op in both
+	// directions. Route them through the Russian ending table instead.
+	if isCyrToken(term) {
+		return cyrMatchForms(term)
+	}
 	if len(runes) < 5 {
-		if isCyrToken(term) && len(runes) >= 3 {
-			// Short Russian stems inflect too: сеть -> сетью, сети.
-			out := make([]string, 0, 12)
-			for _, end := range []string{"ю", "и", "е", "а", "у", "ы", "ой", "ей", "ью", "ям", "ях", "ами"} {
-				out = append(out, term+end)
-			}
-			return out
-		}
 		var out []string
 		for _, form := range []string{term + "s", term + "es", strings.TrimSuffix(term, "s")} {
 			if len(form) >= 3 && form != term {
