@@ -113,7 +113,6 @@ var commands = map[string]command{
 	"install":         func(dir string, rest []string) error { return runInstall(dir, rest, false) },
 	"uninstall":       func(dir string, rest []string) error { return runInstall(dir, rest, true) },
 	"update":          func(_ string, rest []string) error { return runUpdate(rest, os.Stdout) },
-	"show":            cmdShow,
 	"share":           func(dir string, rest []string) error { return runShare(dir, rest, os.Stdout) },
 	"resume":          func(dir string, rest []string) error { return runResume(dir, rest, os.Stdout) },
 	"handoff":         func(dir string, rest []string) error { return runHandoff(dir, rest, os.Stdout) },
@@ -124,12 +123,8 @@ var commands = map[string]command{
 	// likely someone searching for the word than someone asking to launch
 	// an editor, and launching one from a search is not a mistake worth
 	// making. See cmdAider/cmdGoose.
-	"aider":      cmdAider,
-	"goose":      cmdGoose,
 	"hook-goose": cmdGooseHook,
-	"search":     cmdSearch,
 	"blame":      runBlame,
-	"last":       cmdLast,
 }
 
 func run(args []string) error {
@@ -141,10 +136,23 @@ func run(args []string) error {
 		printUsage()
 		return nil
 	}
+	sourceInstance := os.Getenv("DEJA_SOURCE_INSTANCE")
+	switch args[0] {
+	case "show":
+		return cmdShow(dir, args[1:], sourceInstance)
+	case "last":
+		return cmdLast(dir, args[1:], sourceInstance)
+	case "search":
+		return cmdSearch(dir, args[1:], sourceInstance)
+	case "aider":
+		return cmdAider(dir, args[1:], sourceInstance)
+	case "goose":
+		return cmdGoose(dir, args[1:], sourceInstance)
+	}
 	if cmd, ok := commands[args[0]]; ok {
 		return cmd(dir, args[1:])
 	}
-	return runSearch(dir, args)
+	return runSearch(dir, args, sourceInstance)
 }
 
 func cmdVersion(_ string, _ []string) error {
@@ -188,19 +196,81 @@ func cmdHookContext(dir string, rest []string) error {
 	return nil
 }
 
-func cmdShow(dir string, rest []string) error {
-	if len(rest) < 1 {
+func cmdShow(dir string, rest []string, sourceInstance string) error {
+	o, err := parseShow(rest)
+	if err != nil {
+		return err
+	}
+	if o.id == "" {
 		return fmt.Errorf("show needs id-prefix")
 	}
-	s, ok, err := findByPrefix(dir, rest[0])
+	var s model.Session
+	var ok bool
+	if o.harness != "" {
+		s, ok, err = index.FindByIdentity(dir, o.harness, o.id)
+	} else {
+		s, ok, err = findByPrefix(dir, o.id)
+	}
 	if err != nil {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("no session matches %q", rest[0])
+		return fmt.Errorf("no session matches %q", o.id)
+	}
+	if o.json {
+		return printSessionJSON(os.Stdout, s, o.offset, o.limit, sourceInstance)
 	}
 	search.PrintSession(os.Stdout, s)
 	return nil
+}
+
+type showOptions struct {
+	id, harness   string
+	json          bool
+	offset, limit int
+}
+
+func parseShow(args []string) (showOptions, error) {
+	o := showOptions{limit: 50}
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; a {
+		case "--json":
+			o.json = true
+		case "--harness", "--offset", "--limit":
+			if i+1 >= len(args) {
+				return o, fmt.Errorf("%s needs value", a)
+			}
+			i++
+			if a == "--harness" {
+				o.harness = args[i]
+				continue
+			}
+			n, e := strconv.Atoi(args[i])
+			if e != nil || n < 0 || (a == "--limit" && n == 0) {
+				return o, fmt.Errorf("%s needs a positive integer", a)
+			}
+			if a == "--offset" {
+				o.offset = n
+			} else {
+				o.limit = n
+			}
+		default:
+			if strings.HasPrefix(a, "-") {
+				return o, fmt.Errorf("show: unknown flag %q", a)
+			}
+			if o.id != "" {
+				return o, fmt.Errorf("show accepts one session id")
+			}
+			o.id = a
+		}
+	}
+	if o.json && o.harness == "" {
+		return o, fmt.Errorf("show --json requires --harness for exact identity")
+	}
+	if o.limit > 200 {
+		return o, fmt.Errorf("show --limit must not exceed 200")
+	}
+	return o, nil
 }
 
 func cmdCtx(dir string, rest []string) error {
@@ -237,7 +307,7 @@ func cmdCtx(dir string, rest []string) error {
 	return nil
 }
 
-func cmdLast(dir string, rest []string) error {
+func cmdLast(dir string, rest []string, sourceInstance string) error {
 	n, o, err := parseLast(rest)
 	if err != nil {
 		return err
@@ -250,8 +320,14 @@ func cmdLast(dir string, rest []string) error {
 	// command worked, found nothing, or failed silently — which is what a
 	// fresh install sees. blame already answers this shape of question.
 	if len(ss) == 0 {
+		if o.JSON {
+			return printRecentJSON(os.Stdout, nil, sourceInstance)
+		}
 		fmt.Fprintln(os.Stderr, emptyIndexHint("no sessions indexed yet"))
 		return nil
+	}
+	if o.JSON {
+		return printRecentJSON(os.Stdout, ss, sourceInstance)
 	}
 	for _, s := range ss {
 		fmt.Printf("[%s · %s · %s · %s]", s.Harness, s.Project, s.Updated.Format("2006-01-02"), s.ID)
@@ -271,14 +347,14 @@ func cmdLast(dir string, rest []string) error {
 // single word that happens to name a subcommand runs that instead, which is
 // how `/deja uninstall` inside a plugin came back with "nothing matches".
 // Anything shelling out to deja with user text should use this.
-func cmdSearch(dir string, rest []string) error {
+func cmdSearch(dir string, rest []string, sourceInstance string) error {
 	if len(rest) == 0 {
 		return fmt.Errorf("search needs a query")
 	}
-	return runSearch(dir, rest)
+	return runSearch(dir, rest, sourceInstance)
 }
 
-func runSearch(dir string, args []string) error {
+func runSearch(dir string, args []string, sourceInstance string) error {
 	force := false
 	var filtered []string
 	for _, a := range args {
@@ -292,6 +368,7 @@ func runSearch(dir string, args []string) error {
 	if err != nil {
 		return err
 	}
+	o.SourceInstance = sourceInstance
 	o.RecallWorn = usage.WornSessions(dir)
 	prepareFirstIndexGreeting(dir)
 	if err := withBuildProgress(func() error { return index.EnsureForSearch(dir, o, force, os.Stderr) }); err != nil {
@@ -423,6 +500,8 @@ func parseLast(args []string) (int, search.Options, error) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch a {
+		case "--json":
+			o.JSON = true
 		case "--harness", "--project", "--since", "--role":
 			if i+1 >= len(args) {
 				return n, o, fmt.Errorf("%s needs value", a)
@@ -524,7 +603,7 @@ func parseSearch(args []string) (search.Options, error) {
 			o.All = true
 		case "--no-embed":
 			o.NoEmbed = true
-		case "--harness", "--project", "--since", "--role":
+		case "--harness", "--project", "--since", "--role", "--limit":
 			if i+1 >= len(args) {
 				return o, fmt.Errorf("%s needs value", a)
 			}
@@ -537,6 +616,12 @@ func parseSearch(args []string) (search.Options, error) {
 				o.Project = v
 			case "--role":
 				o.Role = v
+			case "--limit":
+				n, err := strconv.Atoi(v)
+				if err != nil || n < 1 || n > 100 {
+					return o, fmt.Errorf("--limit needs an integer from 1 to 100")
+				}
+				o.Limit = n
 			default:
 				d, err := parseDur(v)
 				if err != nil {
@@ -844,7 +929,7 @@ func printUsage() {
 
 Usage:
   deja [flags] <query>
-  deja show <id-prefix>
+  deja show <id-prefix> [--json --harness name] [--offset n] [--limit n]
   deja share <id-prefix>
   deja resume <id-prefix> [--exec]
   deja handoff [--to <agent>] [id-prefix] [--exec]
@@ -856,7 +941,7 @@ Usage:
   deja sync export <dir> [--full]
   deja sync import <dir>
   deja sync ssh <host> [--pull] [--full]
-  deja last [n] [--project name] [--harness name] [--since duration] [--role user|assistant|tool]
+  deja last [n] [--json] [--project name] [--harness name] [--since duration] [--role user|assistant|tool]
   deja sources
   deja completion <bash|zsh|fish>
   deja forget --session <id-prefix> [--project <substring>] [--before <duration|date>] [--dry-run]

@@ -126,6 +126,19 @@ func TestRunInvalidRegexAndResultLimit(t *testing.T) {
 	if len(hits) != 20 {
 		t.Fatalf("all hits = %d", len(hits))
 	}
+	hits, err = Run(ss, Options{Query: "needle", All: true, Limit: 3})
+	if err != nil || len(hits) != 3 {
+		t.Fatalf("explicit limited hits = %d, err=%v", len(hits), err)
+	}
+	scoped := []model.Session{
+		{ID: "wrong-project", Harness: "claude", Project: "other", Messages: []model.Message{{Text: "needle needle needle"}}},
+		{ID: "wrong-harness", Harness: "codex", Project: "target", Messages: []model.Message{{Text: "needle needle"}}},
+		{ID: "wanted", Harness: "claude", Project: "target", Messages: []model.Message{{Text: "needle"}}},
+	}
+	hits, err = Run(scoped, Options{Query: "needle", Harness: "claude", Project: "target", Limit: 1})
+	if err != nil || len(hits) != 1 || hits[0].Session.ID != "wanted" {
+		t.Fatalf("scoped limited hits = %#v, err=%v", hits, err)
+	}
 }
 
 func TestRunFilterSkipsRegexAndTieBranches(t *testing.T) {
@@ -354,6 +367,22 @@ func TestStemmedJSONEnvelope(t *testing.T) {
 	Print(&b, []Hit{{Count: 1}}, Options{JSON: true, Stemmed: true, FuzzyVariants: map[string][]string{"rotation": {"rotated"}}})
 	if !strings.Contains(b.String(), `"schema_version":1`) || !strings.Contains(b.String(), `"stemmed":true`) || !strings.Contains(b.String(), `"rotation":["rotated"]`) {
 		t.Fatalf("stemmed json = %q", b.String())
+	}
+}
+
+func TestSemanticJSONEnvelopeIncludesSource(t *testing.T) {
+	var b bytes.Buffer
+	Print(&b, []Hit{{Session: model.Session{Project: "p"}, Count: 1}}, Options{JSON: true, Semantic: true, SourceInstance: "workstation"})
+	if !strings.Contains(b.String(), `"schema_version":1`) || !strings.Contains(b.String(), `"semantic":true`) || !strings.Contains(b.String(), `"origin":"local"`) || !strings.Contains(b.String(), `"instance":"workstation"`) {
+		t.Fatalf("semantic json = %q", b.String())
+	}
+}
+
+func TestPrintReuseNote(t *testing.T) {
+	var b bytes.Buffer
+	Print(&b, []Hit{{Session: model.Session{Harness: "claude", Project: "p"}, Count: 1, Reused: 3}}, Options{})
+	if !strings.Contains(b.String(), "reused 3×") {
+		t.Fatalf("reuse output = %q", b.String())
 	}
 }
 
