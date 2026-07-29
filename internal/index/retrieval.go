@@ -970,6 +970,10 @@ func scanRecords(dir string, m Manifest, o query.Options, offsets []int64) ([]mo
 	return scanRecordsWithVariants(dir, m, o, offsets, nil)
 }
 
+// roleTool mirrors sources.RoleTool without importing it: this package is
+// below sources, not above it.
+const roleTool = "tool"
+
 func scanRecordsWithVariants(dir string, m Manifest, o query.Options, offsets []int64, variants map[string][]string) ([]model.Session, error) {
 	by := map[string]*model.Session{}
 	add := func(r Record) {
@@ -987,6 +991,14 @@ func scanRecordsWithVariants(dir string, m Manifest, o query.Options, offsets []
 			return
 		}
 		if o.Role != "" && r.Role != o.Role {
+			return
+		}
+		// A tool invocation is an action, not an answer. Left in the ordinary
+		// ranking it pulls a session up because a command line happened to
+		// contain the words of a question — measured at 56 of 260 top-10
+		// positions moving on a real store. So it is indexed and searchable,
+		// but only when asked for by role.
+		if r.Role == roleTool && o.Role != roleTool {
 			return
 		}
 		s := by[r.Key]

@@ -1078,3 +1078,52 @@ func TestFuzzySearchWithPhraseTokens(t *testing.T) {
 		t.Fatalf("reversed phrase result=%#v err=%v", result, err)
 	}
 }
+
+// TestToolRecordsStayOutOfOrdinaryRanking pins the rule that keeps command
+// records from polluting search: they answer "what did I run", never "what did
+// we decide", and left in the ordinary ranking they lift a session because a
+// command line contained the words of a question.
+func TestToolRecordsStayOutOfOrdinaryRanking(t *testing.T) {
+	tmp := hermeticIndexEnv(t)
+	dir := filepath.Join(tmp, "idx")
+	ss := []model.Session{{
+		ID: "s1", Harness: "claude", Project: "app",
+		Started: time.Unix(1700000000, 0), Updated: time.Unix(1700000000, 0),
+		Messages: []model.Message{
+			{Role: "user", Text: "why is the build slow", Time: time.Unix(1700000000, 0)},
+			{Role: roleTool, Text: "$ go build ./... # slow build", Time: time.Unix(1700000001, 0)},
+		},
+	}}
+	if err := os.MkdirAll(filepath.Join(dir+".tmp", "buckets"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSessions(dir+".tmp", dir, ss, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := Search(dir, search.Options{Query: "slow build", All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range hits {
+		for _, m := range s.Messages {
+			if m.Role == roleTool {
+				t.Fatalf("tool record served to an ordinary query: %q", m.Text)
+			}
+		}
+	}
+	byRole, err := Search(dir, search.Options{Query: "slow build", Role: roleTool, All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, s := range byRole {
+		for _, m := range s.Messages {
+			if m.Role == roleTool {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("asking by role returned no command records")
+	}
+}

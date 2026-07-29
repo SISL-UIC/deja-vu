@@ -71,6 +71,11 @@ func parseClaudeTypedFromOffset(path string, offset int64) ([]model.Session, err
 		if txt != "" {
 			s.Messages = append(s.Messages, model.Message{Role: role, Text: txt, Time: t})
 		}
+		if IndexToolCalls() && v.Message != nil {
+			for _, cmd := range claudeCommands(v.Message.Content) {
+				s.Messages = append(s.Messages, model.Message{Role: RoleTool, Text: cmd, Time: t})
+			}
+		}
 	})
 	if len(s.Messages) == 0 {
 		return nil, err
@@ -198,4 +203,53 @@ func scanJSONLBytes(path string, offset int64, fn func([]byte)) error {
 			return err
 		}
 	}
+}
+
+// RoleTool marks a record that is an action rather than something said. Tool
+// *output* has always been indexed — Claude files it under the user role, which
+// is why the index holds megabytes of test output — but the invocation that
+// produced it was dropped, so nothing could say what a piece of output came
+// from, or whether a claimed test run happened at all.
+const RoleTool = "tool"
+
+// IndexToolCalls reports whether tool invocations are indexed. Off by default
+// while the cost is being measured: on a 644 MB corpus the commands are 13.6 MB
+// of new text, about a third again on top of the record log.
+func IndexToolCalls() bool { return os.Getenv("DEJA_INDEX_TOOLS") == "1" }
+
+// claudeCommands pulls the shell commands out of a message's tool_use blocks.
+// Only Bash: the other tools carry paths and arguments rather than something a
+// person would recognise as a thing that ran, and paths are already reachable
+// through the output.
+func claudeCommands(raw json.RawMessage) []string {
+	raw = trimJSONSpace(raw)
+	if len(raw) == 0 || raw[0] != '[' {
+		return nil
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) != nil {
+		return nil
+	}
+	var out []string
+	for _, item := range items {
+		item = trimJSONSpace(item)
+		if len(item) == 0 || item[0] != '{' {
+			continue
+		}
+		var part struct {
+			Type  string `json:"type"`
+			Name  string `json:"name"`
+			Input struct {
+				Command string `json:"command"`
+			} `json:"input"`
+		}
+		if json.Unmarshal(item, &part) != nil {
+			continue
+		}
+		if part.Type != "tool_use" || part.Name != "Bash" || part.Input.Command == "" {
+			continue
+		}
+		out = append(out, "$ "+part.Input.Command)
+	}
+	return out
 }
