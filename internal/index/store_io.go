@@ -6,6 +6,7 @@ import (
 	"compress/flate"
 	"encoding/binary"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -114,12 +115,57 @@ func writeRecord(f *os.File, r Record, t *recordTables) (int64, error) {
 	return off, err
 }
 
+// readRecordAt reads one record without moving the file position.
+//
+// It used to Seek and then read the header and the payload, three syscalls per
+// record. A search over a common term resolves thousands of records, and
+// profiling put 70% of such a search inside this function — almost all of it in
+// the kernel rather than in any decoding.
+//
+// The speculative read covers header and payload in one pread for anything
+// under readAheadSize, which is nearly everything: the median indexed message
+// is a few hundred bytes. A larger record costs a second read, which is the
+// same work the old path did anyway.
 func readRecordAt(f *os.File, off int64, t *recordTables) (Record, error) {
-	if _, err := f.Seek(off, io.SeekStart); err != nil {
+	buf := readAheadPool.Get().(*[]byte)
+	defer readAheadPool.Put(buf)
+	b := *buf
+
+	n, err := f.ReadAt(b, off)
+	// A record at the end of the file returns a short read with io.EOF, which
+	// is not an error here — the record may still be entirely inside it.
+	if err != nil && !errors.Is(err, io.EOF) {
 		return Record{}, err
 	}
-	return readRecord(f, t)
+	// Match what ReadFull did before: nothing at all is io.EOF, a partial
+	// header is an unexpected one. A caller past the end of the file relies on
+	// telling those apart.
+	if n == 0 {
+		return Record{}, io.EOF
+	}
+	if n < 4 {
+		return Record{}, io.ErrUnexpectedEOF
+	}
+	size := binary.LittleEndian.Uint32(b[:4])
+	if size > maxRecordSize {
+		return Record{}, fmt.Errorf("%w: record length %d exceeds cap", errCorruptIndex, size)
+	}
+	if int(size)+4 <= n {
+		return decodeRecord(b[4:4+size], t)
+	}
+	// Too big for the read-ahead: take the payload on its own.
+	payload := make([]byte, size)
+	if _, err := f.ReadAt(payload, off+4); err != nil && !errors.Is(err, io.EOF) {
+		return Record{}, err
+	}
+	return decodeRecord(payload, t)
 }
+
+// readAheadSize covers header plus payload for the overwhelming majority of
+// records in one read; the p99 indexed message is about 8 KB.
+const readAheadSize = 8 * 1024
+
+var readAheadPool = sync.Pool{New: func() any { b := make([]byte, readAheadSize); return &b }}
 
 func eachRecord(path string, t *recordTables, fn func(Record)) error {
 	f, err := os.Open(path)
@@ -781,3 +827,67 @@ func (b *bucketReader) postings(tok string) ([]posting, error) {
 }
 
 func (b *bucketReader) close() { b.entries = nil }
+
+// Coalescing bounds for eachRecordAt. A search over a common term resolves a
+// few thousand records that sit close together in write order — the median hole
+// between two of them is under 3 KB — so reading each one separately pays a
+// pread per record for data the kernel would have handed over in the same page.
+const (
+	spanGapMax  = 16 * 1024  // join across a hole no larger than this
+	spanSizeMax = 512 * 1024 // and never read more than this at once
+)
+
+// eachRecordAt reads records at the given offsets, which must be sorted, and
+// calls fn for each one it could decode. Offsets that turn out to reach past
+// the span read for them fall back to a single read, so a long record costs
+// what it always did rather than forcing the span to grow.
+func eachRecordAt(f *os.File, offsets []int64, t *recordTables, fn func(Record)) {
+	buf := make([]byte, 0, 64*1024)
+	for i := 0; i < len(offsets); {
+		j := i + 1
+		for j < len(offsets) &&
+			offsets[j]-offsets[j-1] <= spanGapMax &&
+			offsets[j]-offsets[i] < spanSizeMax {
+			j++
+		}
+		start := offsets[i]
+		want := int(offsets[j-1]-start) + readAheadSize
+		if cap(buf) < want {
+			buf = make([]byte, want)
+		}
+		b := buf[:want]
+		// A failed span is not fatal: every record in it falls back to its own
+		// read below, which is exactly what the caller used to do for all of
+		// them. Aborting here would silently drop the rest of the results.
+		n, err := f.ReadAt(b, start)
+		if err != nil && !errors.Is(err, io.EOF) {
+			n = 0
+		}
+		b = b[:n]
+		for _, off := range offsets[i:j] {
+			rel := int(off - start)
+			if r, ok := decodeRecordIn(b, rel, t); ok {
+				fn(r)
+				continue
+			}
+			if r, err := readRecordAt(f, off, t); err == nil {
+				fn(r)
+			}
+		}
+		i = j
+	}
+}
+
+// decodeRecordIn decodes the record at rel inside an already-read span, and
+// reports whether the span actually held all of it.
+func decodeRecordIn(b []byte, rel int, t *recordTables) (Record, bool) {
+	if rel < 0 || rel+4 > len(b) {
+		return Record{}, false
+	}
+	size := binary.LittleEndian.Uint32(b[rel : rel+4])
+	if size > maxRecordSize || rel+4+int(size) > len(b) {
+		return Record{}, false
+	}
+	r, err := decodeRecord(b[rel+4:rel+4+int(size)], t)
+	return r, err == nil
+}

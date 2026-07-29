@@ -966,11 +966,11 @@ func scanRecordsWithVariants(dir string, m Manifest, o query.Options, offsets []
 		}
 		defer func() { _ = f.Close() }()
 		offsets = sortedUniqueOffsets(offsets)
-		for _, off := range offsets {
-			if r, err := readRecordAt(f, off, tablesFromManifest(m)); err == nil && recordMatchesQueryVariants(r, o, variants) {
+		eachRecordAt(f, offsets, tablesFromManifest(m), func(r Record) {
+			if recordMatchesQueryVariants(r, o, variants) {
 				add(r)
 			}
-		}
+		})
 	} else {
 		if err := eachRecord(filepath.Join(dir, "records.bin"), tablesFromManifest(m), func(r Record) {
 			if recordMatchesQueryVariants(r, o, variants) {
