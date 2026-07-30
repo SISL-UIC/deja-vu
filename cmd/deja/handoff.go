@@ -46,7 +46,10 @@ func runHandoff(dir string, args []string, stdout io.Writer) error {
 			prefix = args[i]
 		}
 	}
-	pasteOnly := target == "" || target == "antigravity"
+	if canon, ok := handoffAlias[target]; ok {
+		target = canon
+	}
+	pasteOnly := target == "" || handoffPasteOnly[target]
 	if !pasteOnly {
 		if _, ok := handoffCommand(target, ""); !ok {
 			return fmt.Errorf("don't know how to hand off to %q; targets: %s (or omit --to and paste the digest anywhere)", target, strings.Join(handoffTargets(), ", "))
@@ -196,11 +199,21 @@ func handoffCommand(target, prompt string) ([]string, bool) {
 		return []string{"goose", "run", "-t", prompt}, true
 	case "kimi":
 		return []string{"kimi", "-p", prompt}, true
+	case "antigravity":
+		// Antigravity's CLI is `agy`; -i seeds a prompt into an interactive session.
+		return []string{"agy", "-i", prompt}, true
 	default:
 		return nil, false
 	}
 }
 
+// handoffAlias lets a target be spelled the way its own CLI is invoked.
+var handoffAlias = map[string]string{"agy": "antigravity"}
+
+// handoffPasteOnly mirrors the registry's `handoff: paste` entries; the
+// capability drift test keeps the two in sync.
+var handoffPasteOnly = map[string]bool{"openclaw": true, "hermes": true, "roo": true}
+
 func handoffTargets() []string {
-	return []string{"claude", "codex", "opencode", "cursor", "copilot", "gemini", "qwen", "aider", "pi", "grok", "cline", "goose", "kimi"}
+	return []string{"claude", "codex", "opencode", "cursor", "copilot", "gemini", "qwen", "antigravity", "aider", "pi", "grok", "cline", "goose", "kimi"}
 }

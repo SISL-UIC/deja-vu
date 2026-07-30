@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `deja handoff --to agy` starts Antigravity with the digest as its first prompt. It was listed paste-only on the reading that it is a GUI, but its terminal client is `agy` — the binary `deja resume` already calls — and `agy -i <prompt>` opens an interactive session on it. `--to antigravity` is the same target. Thanks to @shgpavel. (#524)
+
+### Fixed
+- `deja handoff --to hermes|openclaw|roo` answered `don't know how to hand off` instead of printing the digest to paste; the paste path now covers every harness the registry marks paste, kept in sync by the capability drift test. Thanks to @shgpavel. (#524)
+
 ## [0.16.3] - 2026-07-30
 
 ### Fixed
@@ -16,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - The comparison page covers the four largest memory projects beyond the six it started with, and no longer claims retroactive indexing is unique to deja — MemPalace mines Claude Code, Codex and Cursor transcripts too. (#310, #525)
+
+### Fixed
+- `deja handoff --to hermes|openclaw|roo` answered `don't know how to hand off` instead of printing the digest to paste; the paste path now covers every harness the registry marks paste, kept in sync by the capability drift test. (#524)
 
 ## [0.16.2] - 2026-07-29
 
