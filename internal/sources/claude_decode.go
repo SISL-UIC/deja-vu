@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -212,10 +213,26 @@ func scanJSONLBytes(path string, offset int64, fn func([]byte)) error {
 // from, or whether a claimed test run happened at all.
 const RoleTool = "tool"
 
-// IndexToolCalls reports whether tool invocations are indexed. Off by default
-// while the cost is being measured: on a 644 MB corpus the commands are 13.6 MB
-// of new text, about a third again on top of the record log.
-func IndexToolCalls() bool { return os.Getenv("DEJA_INDEX_TOOLS") == "1" }
+// IndexToolCalls reports whether tool invocations are indexed. On by default,
+// because a flag nobody enables is a feature nobody has — but only the commands
+// worth keeping: see worthIndexing. All of them together are 13.1 MB on a 644 MB
+// corpus and three quarters of that is `ls`, `cat` and `grep`.
+func IndexToolCalls() bool { return os.Getenv("DEJA_INDEX_TOOLS") != "0" }
+
+// worthIndexing keeps the commands that say what happened — a test run, a build,
+// a deploy, a git or gh operation — and drops the navigation. Measured on a real
+// corpus: 5,051 of 23,774 commands, 3.5 MB of 13.1 MB.
+//
+// The dropped ones are not merely cheap to store, they are actively bad to keep:
+// `cat internal/index/index.go` matches a query about the index and answers
+// nothing.
+var meaningfulCommand = regexp.MustCompile(`\b(go (test|build|vet|run)|golangci-lint|pytest|npm (run )?(test|build)|yarn |cargo |make\b|gh (pr|run|release|issue|workflow)|git (commit|push|rebase|merge|revert|tag|bisect)|docker|kubectl|terraform|deja )`)
+
+var trivialCommand = regexp.MustCompile(`^\s*(ls|cd|pwd|cat|head|tail|echo|grep|rg|find|which|wc|sed|awk|sleep|mkdir|rm|cp|mv|chmod|export|source|touch|open|printf)\b`)
+
+func worthIndexing(cmd string) bool {
+	return meaningfulCommand.MatchString(cmd) && !trivialCommand.MatchString(cmd)
+}
 
 // claudeCommands pulls the shell commands out of a message's tool_use blocks.
 // Only Bash: the other tools carry paths and arguments rather than something a
@@ -247,6 +264,9 @@ func claudeCommands(raw json.RawMessage) []string {
 			continue
 		}
 		if part.Type != "tool_use" || part.Name != "Bash" || part.Input.Command == "" {
+			continue
+		}
+		if !worthIndexing(part.Input.Command) {
 			continue
 		}
 		out = append(out, "$ "+part.Input.Command)

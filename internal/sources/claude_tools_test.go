@@ -37,3 +37,35 @@ func TestClaudeTextStillReadsToolResults(t *testing.T) {
 		t.Fatalf("text=%q", got)
 	}
 }
+
+// The selection is the point: three quarters of command text on a real corpus
+// is navigation that answers nothing and matches queries by accident —
+// `cat internal/index/index.go` looks relevant to a question about the index.
+func TestWorthIndexingKeepsWhatHappened(t *testing.T) {
+	keep := []string{
+		"go test ./internal/index/ -count=1",
+		"golangci-lint run",
+		"gh pr checks 558",
+		"git commit -m 'fix: x'",
+		"make build && deja index --rebuild",
+		"docker compose up -d",
+	}
+	for _, c := range keep {
+		if !worthIndexing(c) {
+			t.Errorf("dropped a command worth keeping: %q", c)
+		}
+	}
+	drop := []string{
+		"cat internal/index/index.go",
+		"ls -la",
+		"grep -rn foo internal/",
+		"cd /repo && pwd",
+		"sed -n 1,40p internal/index/index.go",
+		"echo hi",
+	}
+	for _, c := range drop {
+		if worthIndexing(c) {
+			t.Errorf("kept navigation: %q", c)
+		}
+	}
+}
