@@ -42,6 +42,45 @@ var injectedBlocks = [][2]string{
 	{"<command-name>", "</command-args>"},
 }
 
+// Codex writes its preamble as a user turn rather than under its own role, so
+// a role filter does not reach it. Measured on two stores: it is the first
+// user message in 28 of 28 sessions here and titles 81 of 82 there (#636).
+// Identical in every session and lexically broad — plugin names, tool
+// descriptions, an AGENTS.md persona paragraph — so it outranks real turns on
+// aggregate match count, which makes it a ranking bug rather than a cosmetic
+// one.
+//
+// These are stripped only at the *start* of a message, unlike injectedBlocks.
+// The tags are ordinary enough that a person quotes them: on this store nine
+// Claude sessions contain `<environment_context>` and two contain
+// `<user_instructions>`, every one of them a real turn discussing the very
+// filtering this list implements. A preamble is always the head of the
+// message, so requiring that costs nothing and stops the filter from eating
+// someone's sentence.
+var injectedPrefixBlocks = [][2]string{
+	{"<environment_context>", "</environment_context>"},
+	{"<recommended_plugins>", "</recommended_plugins>"},
+	{"<permissions instructions>", "</permissions instructions>"},
+	{"<skills_instructions>", "</skills_instructions>"},
+	{"<user_instructions>", "</user_instructions>"},
+}
+
+// agentsHeading is the line Codex writes above the AGENTS.md block it injects,
+// and it needs its own rule rather than a place in the list above.
+//
+// As a plain open/close pair it spans from the heading to the *next*
+// `</INSTRUCTIONS>` anywhere in the message, and the two do not have to belong
+// together. A person writing "# AGENTS.md instructions — how do I stop Codex
+// injecting these? Mine is: <INSTRUCTIONS>be terse</INSTRUCTIONS>" lost the
+// whole question, which is precisely the message someone writes when reporting
+// this bug. Requiring the opening tag to follow the heading immediately makes
+// the span the injected block and nothing else.
+const (
+	agentsHeading = "# AGENTS.md instructions"
+	agentsOpen    = "<INSTRUCTIONS>"
+	agentsClose   = "</INSTRUCTIONS>"
+)
+
 // Whole-line markers: a harness note that occupies its own line, with no
 // closing tag. Matched at line granularity so a line quoting one inside a real
 // message does not take the message with it.
@@ -63,6 +102,7 @@ func stripSelfRecall(text string) string {
 	for _, m := range injectedBlocks {
 		text = stripBetweenClosed(text, m[0], m[1])
 	}
+	text = stripInjectedPrefixes(text)
 	return stripInjectedLines(text)
 }
 
@@ -92,6 +132,77 @@ func stripInjectedLines(text string) string {
 // truncated <deja-recall> is still ours, but a sentence mentioning
 // <system-reminder> — a bug report, this file's own tests — is not, and
 // swallowing the rest of it loses what the person actually wrote.
+// stripInjectedPrefixes removes a harness preamble from the head of a message,
+// repeatedly: Codex stacks several of them before the first real turn.
+func stripInjectedPrefixes(text string) string {
+	for again := true; again; {
+		again = false
+		trimmed := strings.TrimSpace(text)
+		if rest, ok := stripAgentsBlock(trimmed); ok {
+			text, again = rest, true
+			continue
+		}
+		for _, m := range injectedPrefixBlocks {
+			if !strings.HasPrefix(trimmed, m[0]) {
+				continue
+			}
+			end, ok := closerAfter(trimmed, m[0], m[1])
+			if !ok {
+				continue
+			}
+			text = trimmed[end:]
+			again = true
+			break
+		}
+	}
+	return text
+}
+
+// stripAgentsBlock removes the AGENTS.md preamble, which is a heading followed
+// immediately by the block it introduces. Anything else that begins with the
+// same words is someone talking about it.
+func stripAgentsBlock(trimmed string) (string, bool) {
+	if !strings.HasPrefix(trimmed, agentsHeading) {
+		return "", false
+	}
+	rest := strings.TrimSpace(trimmed[len(agentsHeading):])
+	if !strings.HasPrefix(rest, agentsOpen) {
+		return "", false
+	}
+	end, ok := closerAfter(rest, agentsOpen, agentsClose)
+	if !ok {
+		return "", false
+	}
+	return rest[end:], true
+}
+
+// closerAfter returns the offset just past the closer that matches the opener
+// at the head of text, counting nested copies of the same tag. Without the
+// count, `<T>a<T>b</T>c</T>tail` strips to `c</T>tail` and leaves a dangling
+// closer in the index.
+func closerAfter(text, open, close string) (int, bool) {
+	depth := 1
+	i := len(open)
+	for i < len(text) {
+		nextClose := strings.Index(text[i:], close)
+		if nextClose < 0 {
+			return 0, false
+		}
+		nextOpen := strings.Index(text[i:], open)
+		if nextOpen >= 0 && nextOpen < nextClose {
+			depth++
+			i += nextOpen + len(open)
+			continue
+		}
+		depth--
+		i += nextClose + len(close)
+		if depth == 0 {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
 func stripBetweenClosed(text, open, close string) string {
 	for {
 		start := strings.Index(text, open)

@@ -108,3 +108,77 @@ func TestIndexDoesNotSwallowItsOwnRecall(t *testing.T) {
 		}
 	}
 }
+
+// Codex injects its preamble as a user turn, so it survives any role filter.
+// It is stripped only at the head of a message: the tags are ordinary enough
+// that people quote them, and nine Claude sessions on the store this was
+// measured against do exactly that (#636).
+func TestStripsCodexPreambleOnlyAtTheHead(t *testing.T) {
+	preamble := "<environment_context>\n  <cwd>/w</cwd>\n</environment_context>\n" +
+		"<recommended_plugins>a long list</recommended_plugins>\n" +
+		"# AGENTS.md instructions\n\n<INSTRUCTIONS>project rules</INSTRUCTIONS>\n"
+	got := stripSelfRecall(preamble + "the actual question")
+	if strings.TrimSpace(got) != "the actual question" {
+		t.Fatalf("got %q, want only the question", got)
+	}
+	if got := strings.TrimSpace(stripSelfRecall(preamble)); got != "" {
+		t.Fatalf("a message that is nothing but preamble should strip to empty, got %q", got)
+	}
+	// A person discussing the tag keeps their sentence.
+	for _, real := range []string{
+		"why does <environment_context> outrank everything?",
+		"the parser should drop <user_instructions> blocks",
+		"see the note about # AGENTS.md instructions in the issue",
+		// A complete pair quoted mid-sentence — the shape that a
+		// strip-anywhere rule eats and a strip-at-the-head rule keeps. Real
+		// messages on this store look exactly like this.
+		"the injected block is <environment_context><cwd>/w</cwd></environment_context> and it wins on match count",
+		"codex sends <recommended_plugins>a list</recommended_plugins> before the first turn",
+	} {
+		if got := stripSelfRecall(real); got != real {
+			t.Errorf("ate a real message:\n  in  %q\n  out %q", real, got)
+		}
+	}
+}
+
+// The AGENTS.md heading only introduces the injected block when the block
+// follows it immediately. As a plain open/close pair it spanned to the next
+// </INSTRUCTIONS> anywhere in the message, so a person asking how to stop
+// Codex injecting these lost their entire question — the exact message someone
+// writes when reporting this.
+func TestAgentsHeadingNeedsItsBlockToFollow(t *testing.T) {
+	real := []string{
+		"# AGENTS.md instructions\n\nHow do I stop Codex injecting these? Mine is:\n<INSTRUCTIONS>be terse</INSTRUCTIONS>\n",
+		"# AGENTS.md instructions are confusing.\n\nWhy does the block end with </INSTRUCTIONS>?",
+		"# AGENTS.md instructions\n\nno block at all here",
+	}
+	for _, in := range real {
+		if got := stripSelfRecall(in); got != in {
+			t.Errorf("ate a real message:\n  in  %q\n  out %q", in, got)
+		}
+	}
+	injected := "# AGENTS.md instructions\n\n<INSTRUCTIONS>project rules</INSTRUCTIONS>\nthe real question"
+	if got := strings.TrimSpace(stripSelfRecall(injected)); got != "the real question" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// Nested copies of the same tag must be counted, or the outer closer is left
+// behind in the index.
+func TestPrefixStripCountsNesting(t *testing.T) {
+	got := stripSelfRecall("<environment_context>a<environment_context>b</environment_context>c</environment_context>tail")
+	if got != "tail" {
+		t.Fatalf("got %q, want the whole nested block gone", got)
+	}
+}
+
+// A truncated rollout, or a Codex release that renames a closing tag, leaves
+// an unclosed block. Stripping to the end of the message would delete real
+// text that follows, so the block stays — deliberately, and stated here so a
+// future change to that behaviour is a decision rather than a slip.
+func TestUnclosedPrefixBlockIsLeftAlone(t *testing.T) {
+	in := "<environment_context>\n<cwd>/w</cwd>\nthe file was cut here"
+	if got := stripSelfRecall(in); got != in {
+		t.Fatalf("got %q", got)
+	}
+}
