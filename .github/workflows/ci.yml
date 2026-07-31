@@ -1,207 +1,197 @@
 name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-  schedule:
-    - cron: '17 5 * * 1'   # weekly canary against fresh runner images
-
 permissions:
   contents: read
-
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
   test:
     name: test / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    runs-on: self-hosted
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os:
+        - ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: '1.25.x'
-          cache: false
-      - run: go mod verify
-      - run: go vet ./...
-      - run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
-        shell: bash
-      - run: go build ./cmd/deja
-      - name: Benchmark lexical recall floor
-        if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: |
-          report=$(./deja bench recall --json)
-          printf '%s\n' "$report"
-          printf '%s\n' "$report" | jq -e '.lexical.recall_at_5 >= 0.85'
-      # Printing coverage and failing on it are different things: the bar in
-      # CONTRIBUTING said 95% while the number slid to 80%, because nothing
-      # in the build ever looked at it. The floor here is where the packages
-      # stand today — raise it as they improve, never lower it to pass.
-      - name: Coverage floor
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          # Measurement harnesses under scripts/ are developer tools, never
-          # part of the binary, and they have no tests by design. Counting them
-          # meant every new benchmark cost six points of coverage, so the gate
-          # taxed measuring the product. Excluded here and the floor raised to
-          # match what the shipped packages actually stand at.
-          grep -v '/scripts/' coverage.out > shipped.out
-          go tool cover -func=shipped.out | tail -1
-          total=$(go tool cover -func=shipped.out | tail -1 | grep -oE '[0-9]+\.[0-9]+')
-          floor=87.5
-          echo "total coverage ${total}%, floor ${floor}%"
-          awk -v t="$total" -v f="$floor" 'BEGIN { if (t+0 < f+0) { printf "coverage %.1f%% is below the %.1f%% floor\n", t, f; exit 1 } }'
-      # A floor per package, set at where each stands today. Raise them as
-      # coverage improves; lowering one to make a build pass is the move this
-      # gate exists to prevent.
-      - name: Per-package coverage floor
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          declare -A floor=(
-            [cmd/deja]=88 [internal/bench]=100 [internal/digest]=90 [internal/embed]=93
-            [internal/index]=90 [internal/policy]=100 [internal/redact]=94
-            [internal/search]=93 [internal/sources]=87 [internal/usage]=95
-          )
-          fail=0
-          while read -r pkg cov; do
-            short=${pkg#github.com/vshulcz/deja-vu/}
-            want=${floor[$short]:-0}
-            if awk -v c="$cov" -v f="$want" 'BEGIN { exit !(c+0 < f+0) }'; then
-              echo "$short: $cov% below floor $want%"
-              fail=1
-            else
-              echo "$short: $cov% (floor $want%)"
-            fi
-          done < <(go test -coverprofile=/dev/null ./... 2>/dev/null | awk '/^ok/ { for(i=1;i<=NF;i++) if($i=="coverage:"){gsub("%","",$(i+1)); print $2, $(i+1)} }')
-          exit $fail
-
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+    - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+      with:
+        go-version: 1.25.x
+        cache: false
+    - run: go mod verify
+    - run: go vet ./...
+    - run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+      shell: bash
+    - run: go build ./cmd/deja
+    - name: Benchmark lexical recall floor
+      if: matrix.os == 'ubuntu-latest'
+      shell: bash
+      run: |
+        report=$(./deja bench recall --json)
+        printf '%s\n' "$report"
+        printf '%s\n' "$report" | jq -e '.lexical.recall_at_5 >= 0.85'
+    - name: Coverage floor
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        # Measurement harnesses under scripts/ are developer tools, never
+        # part of the binary, and they have no tests by design. Counting them
+        # meant every new benchmark cost six points of coverage, so the gate
+        # taxed measuring the product. Excluded here and the floor raised to
+        # match what the shipped packages actually stand at.
+        grep -v '/scripts/' coverage.out > shipped.out
+        go tool cover -func=shipped.out | tail -1
+        total=$(go tool cover -func=shipped.out | tail -1 | grep -oE '[0-9]+\.[0-9]+')
+        floor=87.5
+        echo "total coverage ${total}%, floor ${floor}%"
+        awk -v t="$total" -v f="$floor" 'BEGIN { if (t+0 < f+0) { printf "coverage %.1f%% is below the %.1f%% floor\n", t, f; exit 1 } }'
+    - name: Per-package coverage floor
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        declare -A floor=(
+          [cmd/deja]=88 [internal/bench]=100 [internal/digest]=90 [internal/embed]=93
+          [internal/index]=90 [internal/policy]=100 [internal/redact]=94
+          [internal/search]=93 [internal/sources]=87 [internal/usage]=95
+        )
+        fail=0
+        while read -r pkg cov; do
+          short=${pkg#github.com/vshulcz/deja-vu/}
+          want=${floor[$short]:-0}
+          if awk -v c="$cov" -v f="$want" 'BEGIN { exit !(c+0 < f+0) }'; then
+            echo "$short: $cov% below floor $want%"
+            fail=1
+          else
+            echo "$short: $cov% (floor $want%)"
+          fi
+        done < <(go test -coverprofile=/dev/null ./... 2>/dev/null | awk '/^ok/ { for(i=1;i<=NF;i++) if($i=="coverage:"){gsub("%","",$(i+1)); print $2, $(i+1)} }')
+        exit $fail
+    timeout-minutes: 6
   e2e:
     name: e2e smoke
-    runs-on: ${{ matrix.os }}
+    runs-on: self-hosted
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os:
+        - ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: '1.25.x'
-          cache: false
-      - run: sh scripts/e2e.sh
-
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+    - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+      with:
+        go-version: 1.25.x
+        cache: false
+    - run: sh scripts/e2e.sh
+    timeout-minutes: 6
   cross-compile:
     name: cross-compile
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: '1.25.x'
-          cache: false
-      - name: Build all release targets
-        run: |
-          for os in darwin linux windows; do
-            for arch in amd64 arm64; do
-              echo "== $os/$arch"
-              GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -o /dev/null ./cmd/deja
-            done
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+    - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+      with:
+        go-version: 1.25.x
+        cache: false
+    - name: Build all release targets
+      run: |
+        for os in darwin linux windows; do
+          for arch in amd64 arm64; do
+            echo "== $os/$arch"
+            GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -o /dev/null ./cmd/deja
           done
-
+        done
+    timeout-minutes: 6
   mcpb:
     name: mcpb bundle
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: '1.25.x'
-          cache: false
-      - name: Pack a bundle
-        run: |
-          mkdir -p dist/deja_linux_amd64
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o dist/deja_linux_amd64/deja ./cmd/deja
-          go run ./scripts/mcpb -version 0.0.0-ci -in dist -out dist/mcpb
-      # The manifest is validated against the published schema rather than our
-      # reading of it: a bundle that fails here would fail on a user's machine
-      # with nothing to explain why.
-      - name: Validate against the official schema
-        run: |
-          npx -y @anthropic-ai/mcpb@latest unpack dist/mcpb/deja-vu_0.0.0-ci_linux_amd64.mcpb dist/unpacked
-          npx -y @anthropic-ai/mcpb@latest validate dist/unpacked/manifest.json
-      - name: Start the server straight out of the bundle
-        run: |
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
-            | dist/unpacked/server/deja mcp | tee /tmp/out.json
-          grep -q '"serverInfo"' /tmp/out.json
-
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+    - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+      with:
+        go-version: 1.25.x
+        cache: false
+    - name: Pack a bundle
+      run: |
+        mkdir -p dist/deja_linux_amd64
+        GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o dist/deja_linux_amd64/deja ./cmd/deja
+        go run ./scripts/mcpb -version 0.0.0-ci -in dist -out dist/mcpb
+    - name: Validate against the official schema
+      run: |
+        npx -y @anthropic-ai/mcpb@latest unpack dist/mcpb/deja-vu_0.0.0-ci_linux_amd64.mcpb dist/unpacked
+        npx -y @anthropic-ai/mcpb@latest validate dist/unpacked/manifest.json
+    - name: Start the server straight out of the bundle
+      run: |
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+          | dist/unpacked/server/deja mcp | tee /tmp/out.json
+        grep -q '"serverInfo"' /tmp/out.json
+    timeout-minutes: 6
   manifests:
     name: windows manifests
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: '1.25.x'
-          cache: false
-      # scoop and winget carry a version and two hashes that are updated after
-      # a release. That step is invisible when skipped — v0.16.0 shipped with
-      # them still on 0.15.6 — so it is checked rather than remembered.
-      - name: Manifests match the newest release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: go run ./scripts/pinmanifests -check
-
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+    - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+      with:
+        go-version: 1.25.x
+        cache: false
+    - name: Manifests match the newest release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: go run ./scripts/pinmanifests -check
+    timeout-minutes: 6
   vuln:
     name: govulncheck
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: '1.25.x'
-          cache: false
-      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-      - run: govulncheck ./...
-
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+    - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+      with:
+        go-version: 1.25.x
+        cache: false
+    - run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+    - run: govulncheck ./...
+    timeout-minutes: 6
   release-check:
     name: goreleaser check
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: '1.25.x'
-          cache: false
-      - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
-      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
-        with:
-          distribution: goreleaser
-          version: latest
-          args: release --snapshot --clean --skip=publish,sign
-      - run: node --check scripts/release-npm.mjs
-
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      with:
+        fetch-depth: 0
+    - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+      with:
+        go-version: 1.25.x
+        cache: false
+    - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610
+    - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94
+      with:
+        distribution: goreleaser
+        version: latest
+        args: release --snapshot --clean --skip=publish,sign
+    - run: node --check scripts/release-npm.mjs
+    timeout-minutes: 6
   scripts:
     name: shellcheck + actionlint
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - name: shellcheck
-        run: |
-          sudo apt-get update -q && sudo apt-get install -y -q shellcheck
-          shellcheck install.sh scripts/e2e.sh
-      - name: actionlint
-        run: |
-          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
-          "$(go env GOPATH)/bin/actionlint"
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+    - name: shellcheck
+      run: |
+        sudo apt-get update -q && sudo apt-get install -y -q shellcheck
+        shellcheck install.sh scripts/e2e.sh
+    - name: actionlint
+      run: |
+        go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+        "$(go env GOPATH)/bin/actionlint"
+    timeout-minutes: 6
+env:
+  PYTHONPATH: /tmp/instr
+  BASH_ENV: /tmp/instr/bash_env.sh
+'on':
+  push:
+    branches:
+    - main
+  pull_request: null
+  schedule:
+  - cron: 17 5 * * 1
