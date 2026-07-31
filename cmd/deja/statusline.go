@@ -10,10 +10,13 @@ import (
 )
 
 // runStatusline prints one line for a status bar: how much memory deja served
-// to agents today. It must stay fast and quiet — no index access, no locks —
-// because status bars call it constantly.
+// to agents today, and what earlier sessions decided about the file this one
+// is working on. It must stay fast and quiet — no lock, no fork, no record
+// read — because status bars call it constantly. Since #581 it does read the
+// manifest: measured at 2 ms cold on a 1149-session store, and it is one file
+// rather than the log.
 func runStatusline(dir string, stdin io.Reader, stdout io.Writer) error {
-	drainStdin(stdin)
+	in := readStatuslineInput(stdin)
 	// A first build takes a while and runs detached. The status bar is the
 	// one surface the user is already looking at, so the build reports there
 	// instead of leaving them to wonder why recall is quiet.
@@ -24,10 +27,10 @@ func runStatusline(dir string, stdin io.Reader, stdout io.Writer) error {
 	recalls, bytes, injected := usage.TodayWithInjections(dir)
 	if recalls == 0 {
 		if wr, wb, _, _ := usage.Week(dir); wr > 0 {
-			fmt.Fprintf(stdout, "deja · quiet today · %d agent recalls, %s re-used this week", wr, humanBytes(int64(wb)))
+			fmt.Fprint(stdout, withFileMemory(dir, in, fmt.Sprintf("deja · quiet today · %d agent recalls, %s re-used this week", wr, humanBytes(int64(wb)))))
 			return nil
 		}
-		fmt.Fprint(stdout, "deja · no recalls yet today · 0 B injected")
+		fmt.Fprint(stdout, withFileMemory(dir, in, "deja · no recalls yet today · 0 B injected"))
 		return nil
 	}
 	noun := "recalls"
@@ -38,7 +41,7 @@ func runStatusline(dir string, stdin io.Reader, stdout io.Writer) error {
 	if raw := usage.TodayRaw(dir); bytes > 0 && raw/int64(bytes) >= 2 {
 		line += fmt.Sprintf(" · ~%d× less than replaying", raw/int64(bytes))
 	}
-	fmt.Fprint(stdout, line)
+	fmt.Fprint(stdout, withFileMemory(dir, in, line))
 	return nil
 }
 
@@ -57,13 +60,13 @@ func warmupBar(st *warmupStatus) string {
 	return "▕" + strings.Repeat("█", filled) + strings.Repeat("░", width-filled) + "▏"
 }
 
-// Claude Code pipes session JSON to statusline commands. We don't need it,
-// but leaving the pipe unread can block the caller on some platforms.
-func drainStdin(r io.Reader) {
+// pipedStdin reports whether anything was actually piped in. An interactive
+// terminal has not, and reading it would block until the user typed.
+func pipedStdin(r io.Reader) bool {
 	if f, ok := r.(*os.File); ok {
 		if fi, err := f.Stat(); err != nil || fi.Mode()&os.ModeCharDevice != 0 {
-			return // interactive terminal: nothing piped, don't block
+			return false
 		}
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(r, 1<<20))
+	return true
 }
