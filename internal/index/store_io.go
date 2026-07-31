@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -907,16 +908,67 @@ func decodeRecordIn(b []byte, rel int, t *recordTables) (Record, bool) {
 // because every lookup walks the whole log. One pass over records.bin, keyed
 // by the manifest, is the same data in a single scan.
 func EachToolOutput(dir string, fn func(SessionMeta, Record)) error {
+	return EachRecordOfRole(dir, roleToolOutput, fn)
+}
+
+// EachRecordOfRole streams every record of one role with the session it came
+// from. Ranked retrieval is the wrong instrument when the caller has an exact
+// key and needs every match rather than the best ones — restore is that case
+// (#647), and so is any inventory of what the store holds.
+func EachRecordOfRole(dir, role string, fn func(SessionMeta, Record)) error {
+	if dir == "" {
+		dir = DefaultDir()
+	}
 	m, err := readManifestCached(dir)
 	if err != nil {
 		return err
 	}
 	return eachRecord(filepath.Join(dir, "records.bin"), tablesFromManifest(m), func(r Record) {
-		if r.Role != roleToolOutput {
+		if r.Role != role {
 			return
 		}
 		if meta, ok := m.Sessions[r.Key]; ok {
 			fn(meta, r)
 		}
 	})
+}
+
+// RoleEdit is the record kind holding the exact bytes an agent replaced.
+const RoleEdit = roleEdit
+
+// SpanInventory counts the replaced spans the store holds and the files they
+// belong to.
+//
+// It needs its own pass: a span is served only when asked for by role, because
+// it is the file's old contents rather than a statement about anything, so it
+// never reaches a caller loading sessions the ordinary way.
+//
+// This is what `deja restore` has to hand back, stated as a number before
+// anyone needs it — the command matters entirely at one panicked moment, and
+// nobody reads a command list then (#577). Measured at ~180 ms on a
+// 160k-record store, so it belongs on a page someone opens deliberately.
+func SpanInventory(dir string) (spans, files int, err error) {
+	if dir == "" {
+		dir = DefaultDir()
+	}
+	m, err := readManifestCached(dir)
+	if err != nil {
+		return 0, 0, err
+	}
+	seen := map[string]bool{}
+	err = eachRecord(filepath.Join(dir, "records.bin"), tablesFromManifest(m), func(r Record) {
+		if r.Role != roleEdit {
+			return
+		}
+		spans++
+		// The path is the first line of a span; one without a path still
+		// counts as something recoverable.
+		if i := strings.IndexByte(r.Text, '\n'); i > 0 {
+			seen[r.Text[:i]] = true
+		}
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return spans, len(seen), nil
 }
