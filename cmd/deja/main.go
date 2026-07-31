@@ -215,7 +215,15 @@ func cmdShow(dir string, rest []string, sourceInstance string) error {
 	var s model.Session
 	var ok bool
 	if o.harness != "" {
+		// Exact identity first — that is what --harness is for, and what
+		// --json requires. But the usage line documents an id *prefix*, and
+		// routing --harness straight to the exact lookup made every
+		// prefix+harness call fail: "deja show 019fa282 --harness codex" said
+		// no session matches while the same prefix without --harness worked.
 		s, ok, err = index.FindByIdentity(dir, o.harness, o.id)
+		if err == nil && !ok {
+			s, ok, err = findByPrefixHarness(dir, o.id, o.harness)
+		}
 	} else {
 		s, ok, err = findByPrefix(dir, o.id)
 	}
@@ -592,6 +600,19 @@ func findByPrefix(dir, p string) (model.Session, bool, error) {
 	ss = append(ss, sources.LoadOpencodePrefix(p)...)
 	s, ok := search.FindByPrefix(ss, p)
 	return s, ok, nil
+}
+
+// findByPrefixHarness resolves an id prefix within one harness, so the
+// documented "deja show <id-prefix> --harness name" form works.
+func findByPrefixHarness(dir, p, harness string) (model.Session, bool, error) {
+	s, ok, err := findByPrefix(dir, p)
+	if err != nil || !ok {
+		return model.Session{}, false, err
+	}
+	if s.Harness != harness {
+		return model.Session{}, false, nil
+	}
+	return s, true, nil
 }
 
 func recent(dir string, n int) ([]model.Session, error) {

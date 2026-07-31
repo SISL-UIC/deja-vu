@@ -275,3 +275,75 @@ func TestCodexMalformedThreadIDDoesNotCollapse(t *testing.T) {
 		t.Fatalf("id = %q, want the SessionId when no ThreadId exists", ss[0].ID)
 	}
 }
+
+// Codex writes every turn twice: once as a response_item carrying a role, and
+// once as an event_msg with none. Reading the second and defaulting it to
+// "user" stored each assistant answer a second time as something the person
+// said — 40 mis-roled and 28 duplicated across 25 of 28 rollouts on a real
+// store, 35% of indexed codex messages, and `--role user` returned the
+// agent's own words.
+func TestCodexIgnoresTheDuplicateEventStream(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "rollout-2026-07-27T10-38-00-dup.jsonl")
+	lines := []string{
+		`{"timestamp":"2026-07-27T10:38:00Z","type":"session_meta","payload":{"session_id":"s","id":"dup","cwd":"/w"}}`,
+		`{"timestamp":"2026-07-27T10:38:07Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}`,
+		`{"timestamp":"2026-07-27T10:38:07Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"text","text":"hi"}]}}`,
+		`{"timestamp":"2026-07-27T10:38:09Z","type":"event_msg","payload":{"type":"agent_message","message":"What would you like to work on?"}}`,
+		`{"timestamp":"2026-07-27T10:38:09Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"What would you like to work on?"}]}}`,
+	}
+	if err := os.WriteFile(p, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ss, err := ParseCodexRollout(p)
+	if err != nil || len(ss) != 1 {
+		t.Fatalf("%v %#v", err, ss)
+	}
+	if len(ss[0].Messages) != 2 {
+		t.Fatalf("messages = %d, want the one turn and the one reply: %#v", len(ss[0].Messages), ss[0].Messages)
+	}
+	for _, m := range ss[0].Messages {
+		if m.Role == "user" && strings.Contains(m.Text, "would you like") {
+			t.Fatal("the agent's answer is stored as something the person said")
+		}
+	}
+	if ss[0].Messages[0].Role != "user" || ss[0].Messages[1].Role != "assistant" {
+		t.Fatalf("roles = %q, %q", ss[0].Messages[0].Role, ss[0].Messages[1].Role)
+	}
+}
+
+// history.jsonl repeats the prompts of sessions whose rollout deja already
+// read, with a coarser timestamp, so the ingest de-duplicator never collapsed
+// them and the same question appeared twice in one session.
+func TestCodexHistorySkipsSessionsThatHaveARollout(t *testing.T) {
+	dir := t.TempDir()
+	sessions := filepath.Join(dir, "sessions", "2026", "07", "27")
+	if err := os.MkdirAll(sessions, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rollout := []string{
+		`{"timestamp":"2026-07-27T10:38:00Z","type":"session_meta","payload":{"session_id":"s1","id":"s1","cwd":"/w"}}`,
+		`{"timestamp":"2026-07-27T10:38:07Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"text","text":"the question"}]}}`,
+	}
+	if err := os.WriteFile(filepath.Join(sessions, "rollout-2026-07-27T10-38-00-s1.jsonl"), []byte(strings.Join(rollout, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hist := `{"session_id":"s1","ts":1785500000,"text":"the question"}` + "\n" +
+		`{"session_id":"orphan","ts":1785500001,"text":"a session with no rollout"}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "history.jsonl"), []byte(hist), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DEJA_CODEX_ROOT", dir)
+	ss := LoadCodex()
+	byID := map[string]int{}
+	for _, s := range ss {
+		byID[s.ID] += len(s.Messages)
+	}
+	if byID["s1"] != 1 {
+		t.Fatalf("session s1 has %d messages, want 1 — history repeated the rollout", byID["s1"])
+	}
+	// A session with no rollout is the only reason to read history at all.
+	if byID["orphan"] != 1 {
+		t.Fatalf("orphan history entry lost: %v", byID)
+	}
+}

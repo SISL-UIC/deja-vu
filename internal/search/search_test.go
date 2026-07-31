@@ -656,3 +656,18 @@ func TestVariantDetailSkipsSelfMatch(t *testing.T) {
 		t.Fatalf("real variant detail = %q", d)
 	}
 }
+
+// The same synonym the index applies, for the path that filters loaded
+// sessions rather than records: `--role tool` reached the index correctly and
+// was then dropped here, so the CLI still returned nothing.
+func TestSearchRoleFilterAcceptsTool(t *testing.T) {
+	if !roleMatches("tool-output", "tool") {
+		t.Error("tool must reach tool-output")
+	}
+	if roleMatches("assistant", "tool") {
+		t.Error("tool must not reach speech")
+	}
+	if !roleMatches("user", "user") {
+		t.Error("exact names keep working")
+	}
+}

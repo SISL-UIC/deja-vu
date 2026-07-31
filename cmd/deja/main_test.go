@@ -1293,3 +1293,29 @@ func TestForgetSelectorNamesEverySelector(t *testing.T) {
 		t.Fatal("an empty selector still needs a name")
 	}
 }
+
+// The usage line documents "deja show <id-prefix> [--harness name]", but
+// --harness routed straight to an exact-identity lookup, so every
+// prefix+harness call failed while the same prefix without --harness worked.
+func TestShowAcceptsAPrefixWithHarness(t *testing.T) {
+	dir := seedBriefIndex(t)
+	ss, err := index.Recent(dir, 1)
+	if err != nil || len(ss) == 0 {
+		t.Fatal(err)
+	}
+	full := ss[0].ID
+	prefix := full[:6]
+	out, err := captureRun(t, "show", prefix, "--harness", ss[0].Harness)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, full) {
+		t.Fatalf("prefix with --harness found nothing:\n%s", out)
+	}
+	// The harness still has to match: a prefix belonging to another harness
+	// must not be served.
+	out, _ = captureRunStderr(t, "show", prefix, "--harness", "nosuchharness")
+	if !strings.Contains(out, "no session matches") {
+		t.Fatalf("served a session from the wrong harness: %q", out)
+	}
+}

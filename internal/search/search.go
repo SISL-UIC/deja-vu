@@ -188,7 +188,7 @@ func runScored(ss []model.Session, o Options) ([]Hit, error) {
 			doc.userCount = []int{0}
 		}
 		for _, m := range s.Messages {
-			if o.Role != "" && m.Role != o.Role {
+			if o.Role != "" && !roleMatches(m.Role, o.Role) {
 				continue
 			}
 			low := strings.ToLower(m.Text)
@@ -786,6 +786,17 @@ func PrintSession(w io.Writer, s model.Session) {
 }
 
 // isWorkRecord reports whether a message records what an agent did rather than
+// roleMatches accepts the role names the help text documents. `--role tool`
+// is what `deja help` promises and "tool-output" is what is stored, so the
+// documented spelling matched nothing — silently, with a healthy exit. Mirrors
+// index.roleMatches, which cannot be imported here.
+func roleMatches(stored, want string) bool {
+	if stored == want {
+		return true
+	}
+	return want == "tool" && stored == roleToolOutput
+}
+
 // what was said. Mirrors index.isToolRole, which cannot be imported here.
 func isWorkRecord(role string) bool {
 	switch role {

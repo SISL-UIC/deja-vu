@@ -30,8 +30,21 @@ func LoadCodex() []model.Session {
 	root := CodexRoot()
 	files := walkFiles(filepath.Join(root, "sessions"), codexRolloutWanted)
 	ss := parseFiles(files, ParseCodexRollout)
+	// history.jsonl repeats the prompts of sessions whose rollout deja has
+	// already read, with a coarser timestamp — so the ingest de-duplicator,
+	// which keys on role+time+text, never collapses them and the same
+	// question appears twice in one session. It is only worth reading for
+	// sessions with no rollout at all.
+	seen := make(map[string]bool, len(ss))
+	for _, s := range ss {
+		seen[s.ID] = true
+	}
 	if hist, _ := ParseCodexHistory(filepath.Join(root, "history.jsonl")); len(hist) > 0 {
-		ss = append(ss, hist...)
+		for _, h := range hist {
+			if !seen[h.ID] {
+				ss = append(ss, h)
+			}
+		}
 	}
 	return ss
 }
@@ -146,17 +159,24 @@ func ParseCodexRolloutFromOffset(path string, offset int64) ([]model.Session, er
 			codexPatch(&s, payload, cwd, t)
 			return
 		}
+		// Codex writes every turn twice: once as a response_item carrying a
+		// role, and once as an event_msg whose payload has none. Reading the
+		// second and defaulting it to "user" stored each assistant answer a
+		// second time as something the person said — 40 mis-roled and 28
+		// duplicated across 25 of 28 rollouts, 35% of indexed codex messages,
+		// and `--role user` returned the agent's own words.
+		//
+		// Measured before removing it: all 68 event_msg turns duplicate a
+		// response_item exactly, none is unique. So the event stream carries
+		// no information the roled one lacks.
+		if typ, _ := m["type"].(string); typ == "event_msg" {
+			return
+		}
 		role, _ := payload["role"].(string)
 		if HarnessAuthored(role) {
 			return
 		}
 		txt := textFromContent(payload["content"])
-		if txt == "" {
-			if msg, _ := payload["message"].(string); msg != "" {
-				role = "user"
-				txt = msg
-			}
-		}
 		if role != "" && txt != "" {
 			s.Messages = append(s.Messages, model.Message{Role: role, Text: txt, Time: t})
 		}

@@ -293,3 +293,24 @@ func TestHarnessFilterAcceptsTheNameItPrints(t *testing.T) {
 		}
 	}
 }
+
+// `deja help` documents `--role <user|assistant|tool>` while the stored name
+// is "tool-output", so the documented spelling matched nothing at all —
+// silently, with a healthy exit code.
+func TestRoleFilterAcceptsTheDocumentedName(t *testing.T) {
+	for _, c := range []struct {
+		stored, want string
+		ok           bool
+	}{
+		{"tool-output", "tool", true},
+		{"tool-output", "tool-output", true},
+		{"user", "user", true},
+		{"assistant", "tool", false},
+		{"files", "tool", false},
+		{"command", "command", true},
+	} {
+		if got := roleMatches(c.stored, c.want); got != c.ok {
+			t.Errorf("roleMatches(%q, %q) = %v, want %v", c.stored, c.want, got, c.ok)
+		}
+	}
+}

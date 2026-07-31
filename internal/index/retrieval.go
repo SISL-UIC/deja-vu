@@ -1025,6 +1025,20 @@ func scanRecords(dir string, m Manifest, o query.Options, offsets []int64) ([]mo
 	return scanRecordsWithVariants(dir, m, o, offsets, nil)
 }
 
+// roleMatches accepts the role names the help text documents.
+//
+// `--role <user|assistant|tool>` is what `deja help` promises, and the stored
+// name is "tool-output", so the documented spelling matched nothing at all —
+// silently, with a healthy exit. The three roles that do work today (files,
+// command, edit) are the only way to reach work records and appear in no help
+// text; they keep working under their own names.
+func roleMatches(stored, want string) bool {
+	if stored == want {
+		return true
+	}
+	return want == "tool" && stored == roleToolOutput
+}
+
 // harnessMatches accepts the name deja prints as well as the one it stores.
 //
 // Notes are stored under the harness "deja" and narrated during indexing as
@@ -1075,7 +1089,7 @@ func scanRecordsWithVariants(dir string, m Manifest, o query.Options, offsets []
 		if o.Since > 0 && meta.Updated.Before(time.Now().Add(-o.Since)) {
 			return
 		}
-		if o.Role != "" && r.Role != o.Role {
+		if o.Role != "" && !roleMatches(r.Role, o.Role) {
 			return
 		}
 		// A file list is a record of what a turn touched, not something said.
