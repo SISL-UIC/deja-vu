@@ -70,7 +70,7 @@ func opencodeConfigHome() string {
 }
 
 func guidanceText(harness string) string {
-	if harness == "claude-code" || harness == "claude" || harness == "antigravity" || harness == "copilot" || harness == "pi" {
+	if guidanceOwnsWholeFile(harness) {
 		body := guidanceBody
 		if harness == "copilot" {
 			body = "deja does not index Copilot history. It is a consumer: use the deja MCP tools to search memory from the other harnesses.\n\n" + guidanceBody
@@ -106,7 +106,7 @@ func installGuidance(harness string, uninstall bool) (installResult, error) {
 		return installResult{}, err
 	}
 	var next []byte
-	if harness == "claude-code" || harness == "claude" || harness == "antigravity" || harness == "copilot" || harness == "pi" {
+	if guidanceOwnsWholeFile(harness) {
 		if uninstall {
 			if len(old) == 0 {
 				return installResult{Path: path, Action: "unchanged"}, nil
@@ -200,15 +200,48 @@ func guidanceHarness(harness string) string {
 	}
 }
 
+// guidanceOwnsWholeFile reports whether install writes the whole file rather
+// than a marked block inside someone else's. A skill file lives in deja's own
+// directory and has no marker in it; AGENTS.md and its siblings belong to the
+// user, and deja only ever appends a marked block there.
+func guidanceOwnsWholeFile(harness string) bool {
+	switch harness {
+	case "claude-code", "claude", "antigravity", "copilot", "pi":
+		return true
+	}
+	return false
+}
+
+// guidanceStatus reports whether deja's guidance is in that file, not merely
+// whether the file exists. Anyone who keeps their own AGENTS.md was told deja
+// had written guidance there when nothing from deja had ever been installed
+// (#637). Install leaves a marked block in a shared file, so the marker is
+// what to look for — and "the file is there but ours is not" is a different
+// answer from "there is no file", because only the first means someone else
+// owns it. A skill file deja writes whole has no marker and does not need one.
 func guidanceStatus(harness string) string {
+	// One form throughout: the path lookup took the raw name and the
+	// whole-file check took the normalised one, so the function contradicted
+	// itself about which it accepts.
+	harness = guidanceHarness(harness)
 	path := guidancePath(harness)
 	if path == "" {
 		return "unsupported"
 	}
-	if _, err := os.Stat(path); err == nil {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "missing"
+	}
+	// An empty file is an interrupted write, not guidance — the one shape
+	// where "the file exists" still fails to mean "we wrote it" even in a
+	// directory deja owns.
+	if len(strings.TrimSpace(string(b))) == 0 {
+		return "absent"
+	}
+	if guidanceOwnsWholeFile(harness) || strings.Contains(string(b), guidanceStart) {
 		return "written"
 	}
-	return "missing"
+	return "absent"
 }
 
 func guidanceResult(harness string, uninstall bool) (installResult, error) {

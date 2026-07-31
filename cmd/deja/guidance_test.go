@@ -285,3 +285,103 @@ func TestInstallGuidanceSkillErrorBranches(t *testing.T) {
 		t.Fatalf("antigravity re-uninstall = %#v err=%v", r, err)
 	}
 }
+
+// Guidance is "written" when deja's block is in the file, not when the file
+// exists. Anyone keeping their own AGENTS.md was told deja had written
+// guidance there on a machine where install had never run (#637).
+func TestGuidanceStatusReadsTheMarkerNotTheFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, ".codex", "AGENTS.md")
+
+	if got := guidanceStatus("codex"); got != "missing" {
+		t.Fatalf("no file at all: got %q", got)
+	}
+	if err := os.WriteFile(path, []byte("# my own agents file\n\nnothing from deja\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := guidanceStatus("codex"); got != "absent" {
+		t.Fatalf("someone else's file: got %q, want absent", got)
+	}
+	if err := os.WriteFile(path, []byte("# mine\n\n"+guidanceStart+"\nbody\n"+guidanceEnd+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := guidanceStatus("codex"); got != "written" {
+		t.Fatalf("our block is in it: got %q", got)
+	}
+}
+
+// A skill file is deja's own, written whole, and carries no marker — so the
+// marker check must not apply to it. This is a guard for the carve-out rather
+// than a test of the #637 fix: it passes against the old stat-only behaviour
+// too, and it exists so that behaviour cannot be restored by accident when
+// the marker check moves.
+func TestGuidanceStatusForAFileDejaOwnsWhole(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	skill := filepath.Join(home, ".claude", "skills", "deja-history")
+	if err := os.MkdirAll(skill, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := guidanceStatus("claude-code"); got != "missing" {
+		t.Fatalf("no skill file: got %q", got)
+	}
+	if err := os.WriteFile(filepath.Join(skill, "SKILL.md"), []byte("---\nname: deja-history\n---\n\nbody with no marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := guidanceStatus("claude-code"); got != "written" {
+		t.Fatalf("a skill file deja wrote whole: got %q, want written", got)
+	}
+	// An empty file is an interrupted write, not guidance — the one shape
+	// where existence still fails to mean "we wrote it" in a directory deja
+	// owns.
+	if err := os.WriteFile(filepath.Join(skill, "SKILL.md"), []byte("  \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := guidanceStatus("claude-code"); got != "absent" {
+		t.Fatalf("an empty skill file: got %q, want absent", got)
+	}
+}
+
+// Every harness whose guidance is a file deja writes whole, so none of them
+// can be dropped from the helper unnoticed — and the helper must name exactly
+// the set the install path branches on, or doctor starts lying again.
+func TestGuidanceOwnsWholeFileMatchesTheInstallPath(t *testing.T) {
+	for _, h := range []string{"claude-code", "claude", "antigravity", "copilot", "pi"} {
+		if !guidanceOwnsWholeFile(h) {
+			t.Errorf("%q is written whole by installGuidance", h)
+		}
+		// guidanceText branches on the same helper: a whole-file harness gets
+		// skill frontmatter, never the marker pair.
+		if txt := guidanceText(h); strings.Contains(txt, guidanceStart) {
+			t.Errorf("%q got marker text for a file deja owns whole", h)
+		}
+	}
+	for _, h := range []string{"codex", "opencode", "gemini", "qwen", "kimi", "grok"} {
+		if guidanceOwnsWholeFile(h) {
+			t.Errorf("%q shares its file with the user", h)
+		}
+		if txt := guidanceText(h); !strings.Contains(txt, guidanceStart) {
+			t.Errorf("%q must get a marked block, not a whole file", h)
+		}
+	}
+}
+
+// The path lookup took the raw name while the whole-file check took the
+// normalised one, so the function contradicted itself about what it accepts.
+func TestGuidanceStatusAcceptsAliases(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	for _, alias := range []string{"opencode-auto", "codex-auto", "claude-auto"} {
+		if got := guidanceStatus(alias); got == "unsupported" {
+			t.Errorf("%q resolves to a real harness but reported %q", alias, got)
+		}
+	}
+}

@@ -33,6 +33,26 @@ func withTempStores(t *testing.T) string {
 	return h
 }
 
+// captureRunStderr is captureRun for the channel advice goes to.
+func captureRunStderr(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+	err = run(args)
+	_ = w.Close()
+	os.Stderr = old
+	return <-done, err
+}
+
 func captureRun(t *testing.T, args ...string) (string, error) {
 	t.Helper()
 	old := os.Stdout
@@ -275,25 +295,29 @@ func TestLastFiltersSinceAndRole(t *testing.T) {
 }
 
 func TestLastParserAndSourceFilters(t *testing.T) {
-	n, o, err := parseLast([]string{"25", "--harness", "codex", "--project", "api"})
+	n, o, _, err := parseLast([]string{"25", "--harness", "codex", "--project", "api"})
 	if err != nil || n != 25 || o.Harness != "codex" || o.Project != "api" {
 		t.Fatalf("parseLast = n:%d options:%#v err:%v", n, o, err)
 	}
-	n, o, err = parseLast([]string{"5", "--since", "7d", "--role", "assistant"})
+	n, o, raw, err := parseLast([]string{"5", "--since", "7d", "--role", "assistant"})
 	if err != nil || n != 5 || o.Since != 7*24*time.Hour || o.Role != "assistant" {
 		t.Fatalf("parseLast since/role = n:%d options:%#v err:%v", n, o, err)
 	}
-	n, o, err = parseLast([]string{"bad"})
-	if err != nil || n != 10 || o.Harness != "" || o.Project != "" {
-		t.Fatalf("parseLast compatibility = n:%d options:%#v err:%v", n, o, err)
+	// The raw flag comes back so an empty result can echo what was typed.
+	if raw != "7d" {
+		t.Fatalf("sinceRaw = %q, want the flag as typed", raw)
 	}
-	if _, _, err := parseLast([]string{"--unknown"}); err == nil || !strings.Contains(err.Error(), "unknown flag") {
+	n, o, raw, err = parseLast([]string{"bad"})
+	if err != nil || n != 10 || o.Harness != "" || o.Project != "" || raw != "" {
+		t.Fatalf("parseLast compatibility = n:%d options:%#v raw:%q err:%v", n, o, raw, err)
+	}
+	if _, _, _, err := parseLast([]string{"--unknown"}); err == nil || !strings.Contains(err.Error(), "unknown flag") {
 		t.Fatalf("parseLast unknown flag err=%v", err)
 	}
-	if _, _, err := parseLast([]string{"--harness"}); err == nil || !strings.Contains(err.Error(), "--harness needs value") {
+	if _, _, _, err := parseLast([]string{"--harness"}); err == nil || !strings.Contains(err.Error(), "--harness needs value") {
 		t.Fatalf("parseLast missing harness err=%v", err)
 	}
-	if _, _, err := parseLast([]string{"--since", "bad"}); err == nil {
+	if _, _, _, err := parseLast([]string{"--since", "bad"}); err == nil {
 		t.Fatalf("parseLast bad since err=%v", err)
 	}
 
@@ -551,12 +575,64 @@ func TestStemmedOutputIsDeterministic(t *testing.T) {
 	}
 }
 
-func TestPrintNoMatchesHelpfulMessage(t *testing.T) {
+// The count is the size of the store, not the size of whatever the query
+// loaded — which on the index-backed path is zero by definition when nothing
+// matched. "no matches in 0 indexed sessions" is reserved in
+// internal/index/manifest.go as the signature of a corrupt store, and it was
+// printing on every ordinary miss (#637).
+func TestPrintNoMatchesReportsTheStoreSize(t *testing.T) {
+	dir := seedBriefIndex(t)
 	var b bytes.Buffer
-	printNoMatches(&b, "jwt refresh token", 3)
+	printNoMatches(&b, dir, "jwt refresh token")
 	out := b.String()
-	if !strings.Contains(out, `deja: no matches in 3 indexed sessions — try fewer words or --re`) || !strings.Contains(out, `query "jwt refresh token"`) {
+	if strings.Contains(out, "in 0 indexed session") {
+		t.Fatalf("printed the corruption signature for a healthy index: %q", out)
+	}
+	if !strings.Contains(out, "in 1 indexed session ") || !strings.Contains(out, `query "jwt refresh token"`) {
 		t.Fatalf("bad no-match message: %q", out)
+	}
+	// No index at all: say nothing rather than a wrong number.
+	var b2 bytes.Buffer
+	printNoMatches(&b2, filepath.Join(t.TempDir(), "gone"), "q")
+	if strings.Contains(b2.String(), "indexed session") {
+		t.Fatalf("invented a count with no index: %q", b2.String())
+	}
+}
+
+func TestActiveFiltersNamesWhatEmptiedTheResult(t *testing.T) {
+	if got := activeFilters(search.Options{}, ""); got != "" {
+		t.Fatalf("no filters set, got %q", got)
+	}
+	// Each filter alone, so none of them can be deleted unnoticed.
+	for _, c := range []struct {
+		o    search.Options
+		want string
+	}{
+		{search.Options{Harness: "codex"}, `harness "codex"`},
+		{search.Options{Project: "api-gateway"}, `project "api-gateway"`},
+		{search.Options{Role: "command"}, `role "command"`},
+		{search.Options{Since: 24 * time.Hour}, "since 24h0m0s"},
+	} {
+		if got := activeFilters(c.o, ""); got != c.want {
+			t.Errorf("got %q, want %q", got, c.want)
+		}
+	}
+	got := activeFilters(search.Options{Harness: "codex", Project: "api", Role: "command", Since: 24 * time.Hour}, "7d")
+	for _, want := range []string{`harness "codex"`, `project "api"`, `role "command"`, "since 7d", " and "} {
+		if !strings.Contains(got, want) {
+			t.Errorf("%q missing from %q", want, got)
+		}
+	}
+	// What the reader typed, not Go duration syntax: they passed 7d, not
+	// 168h0m0s.
+	if strings.Contains(got, "168h") {
+		t.Errorf("echoed the parsed duration instead of the flag: %q", got)
+	}
+	// parseDur accepts a negative, and filterRecentSources applies no time
+	// filter for one — so naming it would report a filter that never ran and
+	// suppress the empty-store advice, which is the right answer there.
+	if got := activeFilters(search.Options{Since: -time.Hour}, "-1h"); got != "" {
+		t.Errorf("named a filter that was never applied: %q", got)
 	}
 }
 
@@ -1093,5 +1169,76 @@ func TestSearchFlagsAcceptTheEqualsForm(t *testing.T) {
 	// An unknown flag with a value is still an unknown flag, not a query term.
 	if _, err := parseSearch([]string{"--nope=1", "needle"}); err == nil {
 		t.Log("unknown --flag=value is treated as a query term; acceptable, but worth knowing")
+	}
+}
+
+// "run deja index" is advice for an empty store. With a filter set it is
+// advice for a state the tool is not in: indexing changes nothing and doctor
+// reports the stores as found (#637).
+func TestLastWithFiltersNamesTheFilter(t *testing.T) {
+	dir := seedBriefIndex(t)
+	_ = dir
+	out, err := captureRunStderr(t, "last", "3", "--harness", "nosuchharness")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "no sessions indexed yet") {
+		t.Fatalf("blamed the index for a filter: %q", out)
+	}
+	if !strings.Contains(out, `harness "nosuchharness"`) {
+		t.Fatalf("did not name the filter: %q", out)
+	}
+	// Unfiltered on an empty store keeps the original advice, which is right
+	// for the fresh-install case it was written for.
+	empty := t.TempDir()
+	t.Setenv("DEJA_INDEX_DIR", filepath.Join(empty, "index.db"))
+	t.Setenv("DEJA_CLAUDE_ROOT", filepath.Join(empty, "none"))
+	out, err = captureRunStderr(t, "last", "3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "no sessions indexed yet") {
+		t.Fatalf("lost the empty-store advice: %q", out)
+	}
+}
+
+// SessionCount must count sessions, not files: a store where one file holds
+// several sessions is the shape that tells them apart, and the fixture the
+// no-match message uses has one of each.
+func TestSessionCountCountsSessionsNotFiles(t *testing.T) {
+	tmp := hermeticEnv(t)
+	root := filepath.Join(tmp, "claude", "proj-c")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DEJA_CLAUDE_ROOT", filepath.Join(tmp, "claude"))
+	// Two files carry a session; two more are scanned and carry none, so the
+	// file count and the session count cannot be confused for each other.
+	for _, sid := range []string{"c1", "c2"} {
+		body := `{"type":"user","sessionId":"` + sid + `","cwd":"/w/c","timestamp":"2026-07-20T10:00:00Z","message":{"role":"user","content":"work in ` + sid + `"}}` + "\n"
+		if err := os.WriteFile(filepath.Join(root, sid+".jsonl"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"empty1.jsonl", "empty2.jsonl"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dir := index.DefaultDir()
+	if err := index.Ensure(dir, "", true, nil); err != nil {
+		t.Fatal(err)
+	}
+	n, err := index.SessionCount(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("SessionCount = %d, want the 2 sessions across 4 scanned files", n)
+	}
+	var b bytes.Buffer
+	printNoMatches(&b, dir, "nothing")
+	if !strings.Contains(b.String(), "in 2 indexed sessions") {
+		t.Fatalf("message = %q", b.String())
 	}
 }
